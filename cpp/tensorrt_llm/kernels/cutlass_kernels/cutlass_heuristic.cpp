@@ -404,15 +404,21 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(CutlassGemmConfig::Ca
 {
 #ifdef FAST_BUILD
     // Fast build disables all configs except this one for SM100
-    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B, MainloopScheduleType::AUTO,
-        EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
+    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
+        MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
 #else
     if (config & CutlassGemmConfig::GROUPED_GEMM)
     {
         std::vector<CutlassGemmConfig> candidate_configs;
         if ((config & CutlassGemmConfig::FP4_ONLY) != 0)
         {
-            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B,
+            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
+                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
+            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
+                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
+            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x256x64B,
+                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
+            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape256x128x64B,
                 MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
             return candidate_configs;
         }
@@ -428,21 +434,6 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(CutlassGemmConfig::Ca
 #endif
 
 } // namespace kernels
-
-// std::vector<CutlassGemmConfig> get_candidate_configs_sm120_fp4(CutlassGemmConfig::CandidateConfigTypeParam const
-// config)
-// {
-//     std::vector<CutlassGemmConfig> candidate_configs;
-//     if (config & CutlassGemmConfig::FP4_ONLY)
-//     {
-//         candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
-//         MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-//     }
-//     else
-//     {
-//         TLLM_THROW("Not Implemented: SM120 GEMM candidates have not been defined for this configuration.");
-//     }
-// }
 
 std::vector<CutlassGemmConfig> get_candidate_configs(
     int sm, int const max_split_k, CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
