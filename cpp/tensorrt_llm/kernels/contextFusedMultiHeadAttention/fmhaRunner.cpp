@@ -415,7 +415,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.kernel_s = 0;
         mLaunchParams.force_unroll = true;
         // enable tiled kernels on Ampere/Ada
-        if ((isSm89 || isSm120) && mFixedParams.dataType == DATA_TYPE_E4M3)
+        if ((isSm89) && mFixedParams.dataType == DATA_TYPE_E4M3)
         {
             // so far Ada QMMA only supports non-tiled kernels.
             mLaunchParams.granular_tiling = false;
@@ -472,7 +472,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         // Now we have SM90 generation MLA kernels. These treatments are only for context MLA and non SM90 generation
         // MLA.
         bool isFP8GenerationMLA = mFixedParams.dataType == DATA_TYPE_E4M3
-            && (mFixedParams.headSize == 576 && mFixedParams.headSizeV == 512);
+            && (mFixedParams.headSize == 576 && mFixedParams.headSizeV == 512) && isSm90;
         if (!isFP8GenerationMLA)
         {
             mLaunchParams.granular_tiling = true;
