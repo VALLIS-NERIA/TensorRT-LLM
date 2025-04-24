@@ -915,7 +915,7 @@ int AttentionOp::mlaGeneration(
     params.quant_scale_kv = generation_params.kv_scale_orig_quant;
     params.dequant_scale_q = generation_params.kv_scale_quant_orig;
     params.dequant_scale_kv = generation_params.kv_scale_quant_orig;
-    params.host_bmm1_scale = 1 / (sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
+    params.host_bmm1_scale = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
 
     invokeMLARopeGeneration<T>(params, kv_cache_buffer, stream);
     sync_check_cuda_error(stream);
