@@ -34,7 +34,7 @@ import numpy as np
 from backend_request_func import (ASYNC_REQUEST_FUNCS,
                                   OPENAI_COMPATIBLE_BACKENDS, RequestFuncInput,
                                   RequestFuncOutput, get_tokenizer)
-from benchmark_dataset import (AIMODataset, BurstGPTDataset,
+from benchmark_dataset import (AIMODataset, BenchmarkDataset, BurstGPTDataset,
                                ConversationDataset, HuggingFaceDataset,
                                InstructCoderDataset, RandomDataset,
                                SampleRequest, ShareGPTDataset, SonnetDataset,
@@ -44,6 +44,34 @@ from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
+
+
+class JsonFileDataset(BenchmarkDataset):
+    """
+    Custom dataset class for benchmarking.
+    This is a placeholder and should be replaced with actual dataset logic.
+    """
+    def __init__(self, dataset_path: str, **kwargs):
+        super().__init__(dataset_path=dataset_path, **kwargs)
+        # Initialize dataset-specific attributes here
+
+    def sample(self, num_requests: int) -> list[SampleRequest]:
+        samples = []
+        with open(self.dataset_path, 'r') as f:
+            obj = json.load(f)
+        i = 0
+        for item in obj:
+            samples.append(
+                SampleRequest(
+                    prompt=item['prompt'],
+                    prompt_len=item['prompt_len'],
+                    expected_output_len=item['expected_output_len'],
+                )
+            )
+            i += 1
+            if i >= num_requests:
+                break
+        return samples
 
 
 @dataclass
@@ -550,8 +578,10 @@ def main(args: argparse.Namespace):
         raise ValueError(
             "Please specify '--dataset-name' and the corresponding "
             "'--dataset-path' if required.")
-
-    if args.dataset_name == "sonnet":
+    if args.dataset_name == "file":
+        dataset = JsonFileDataset(dataset_path=args.dataset_path)
+        input_requests = dataset.sample(num_requests=args.num_prompts)
+    elif args.dataset_name == "sonnet":
         dataset = SonnetDataset(dataset_path=args.dataset_path)
         # For the "sonnet" dataset, formatting depends on the backend.
         if args.backend == "openai-chat":
@@ -772,7 +802,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf"],
+        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "file"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",

@@ -182,9 +182,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         auto makeFormatter = [cacheManager, isMLA, this]() -> std::unique_ptr<IOFormatter>
         {
             return isMLA ? std::unique_ptr<IOFormatter>(
-                       std::make_unique<MLACacheFormatter>(cacheManager, this->mCacheTransBufferManager.get()))
+                               std::make_unique<MLACacheFormatter>(cacheManager, this->mCacheTransBufferManager.get()))
                          : std::unique_ptr<IOFormatter>(
-                             std::make_unique<CacheFormatter>(cacheManager, this->mCacheTransBufferManager.get()));
+                               std::make_unique<CacheFormatter>(cacheManager, this->mCacheTransBufferManager.get()));
         };
 
         mDataResponder = std::make_unique<DataResponder>(
@@ -328,7 +328,6 @@ void updateKVCacheTransferBW(mpi::MpiComm const& mpiComm, LlmRequest* request)
     auto sendBufferSize = sendBuffer.size();
     auto recvBufferSize = sendBufferSize * worldSize;
     std::vector<char> recvBuffer(recvBufferSize);
-
     mpiComm.allgather(sendBuffer.data(), recvBuffer.data(), sendBufferSize, mpi::MpiType::kCHAR);
 
     su::VectorWrapBuf<char> strbuf(recvBuffer);
@@ -410,8 +409,7 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
     // Make sure there are at least atLeastRequestNum requests in toCompleteIdSet.
     // This will preserve the order of insertion for KVCache transfer requests.
     for (auto it = mResponderFutures.begin();
-         atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()) && it != mResponderFutures.end();
-         ++it)
+        atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()) && it != mResponderFutures.end(); ++it)
     {
         auto& [request, future] = *it;
         toCompleteIdSet.insert(request->mRequestId);
@@ -522,7 +520,9 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             // Gather the kv cache transfer time from all workers and update to leader rank
             if (!common::getEnvKVCacheTransferOutputPath().empty())
             {
-                updateKVCacheTransferBW(*mMpiGroupComm, it->first);
+                auto syncComm
+                    = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupDataComm.get() : mMpiGroupComm;
+                updateKVCacheTransferBW(*syncComm, it->first);
             }
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                 "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",

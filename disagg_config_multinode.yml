@@ -1,0 +1,11 @@
+hostname: smc521ge-0036
+port: 8000
+backend: pytorch
+context_servers:
+  num_instances: 1
+  urls:
+      - "smc521ge-0036:8001"
+generation_servers:
+  num_instances: 1
+  urls:
+      - "smc521ge-0038:8002"

@@ -80,7 +80,7 @@ RUN pip3 install --upgrade --no-cache-dir \
     "h11>=0.16" \
     "tornado>=6.5.0" \
     "setuptools>=78.1.1,<80"
-
+RUN apt update && apt install -y infiniband-diags rdma-core ibverbs-utils
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
 FROM devel AS tritondevel

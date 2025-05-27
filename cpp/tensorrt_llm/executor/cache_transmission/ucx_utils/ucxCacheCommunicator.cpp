@@ -56,6 +56,26 @@ static std::string getLocalIp()
         perror("getifaddrs");
         return ip;
     }
+    int rank = mpi::MpiComm::world().getRank();
+    std::string ucxInterface = common::getEnvUCXInterface();
+    if (ucxInterface.find(",") != std::string::npos)
+    {
+        // split the comma-separated interfaces
+        std::vector<std::string> interfaces;
+        size_t pos = 0;
+        size_t end = ucxInterface.find(",", pos);
+        while (end != std::string::npos)
+        {
+            interfaces.push_back(ucxInterface.substr(pos, end - pos));
+            pos = end + 1;
+            end = ucxInterface.find(",", pos);
+        }
+        if (pos < ucxInterface.size())
+        {
+            interfaces.push_back(ucxInterface.substr(pos));
+        }
+        ucxInterface = interfaces[rank / 2];
+    }
 
     // Loop through the linked list of interfaces
     for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
@@ -64,7 +84,6 @@ static std::string getLocalIp()
         if (ifa->ifa_addr == nullptr)
             continue;
 
-        std::string ucxInterface = common::getEnvUCXInterface();
         if (!ucxInterface.empty() && strcmp(ifa->ifa_name, ucxInterface.c_str()) != 0)
         {
             continue;
@@ -84,7 +103,7 @@ static std::string getLocalIp()
             char address_buffer[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
 
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s", ifa->ifa_name,
+            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s", ifa->ifa_name,
                 address_buffer);
             ip = address_buffer;
             break;
@@ -169,7 +188,7 @@ UcxConnectionManager::UcxConnectionManager()
                 su::VectorWrapBuf<char> strbuf(serBuffer);
                 std::istream is(&strbuf);
                 socketStates[i] = su::deserialize<executor::kv_cache::SocketState>(is);
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " recv  socketStates[%d]: %s", i,
+                TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), " recv  socketStates[%d]: %s", i,
                     socketStates[i].toString().c_str());
             }
         }
