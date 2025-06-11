@@ -242,9 +242,20 @@ public:
 
         std::lock_guard<std::mutex> lock(mMutex);
         mRequestKVCacheTranfserMeasure[requestId].emplace_back(duration, bandwidth);
+        count++;
+        if (count == 1 || count % 100 == 0)
+        {
+            writeToFile();
+        }
     }
 
     ~KvCacheMeasureHelper()
+    {
+        writeToFile();
+    }
+
+private:
+    void writeToFile()
     {
         if (!mRequestKVCacheTranfserMeasure.empty() && !mOutputPath.empty())
         {
@@ -278,10 +289,10 @@ public:
         }
     }
 
-private:
     std::map<LlmRequest::RequestIdType, std::vector<std::pair<double, double>>> mRequestKVCacheTranfserMeasure;
     std::string mOutputPath;
     std::mutex mMutex;
+    size_t count{0};
 };
 
 } // namespace tensorrt_llm::batch_manager
