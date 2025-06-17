@@ -304,9 +304,12 @@ void allocatePlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& 
                 TLLM_CUDA_CHECK(cudaMallocManaged(ptr, size));
                 int cur_dev;
                 TLLM_CUDA_CHECK(cudaGetDevice(&cur_dev));
-                TLLM_CUDA_CHECK(cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, cur_dev));
-                TLLM_CUDA_CHECK(cudaMemAdvise(*ptr, size, cudaMemAdviseSetAccessedBy, cur_dev));
-                TLLM_CUDA_CHECK(cudaMemAdvise(*ptr, size, cudaMemAdviseSetAccessedBy, cudaCpuDeviceId));
+                TLLM_CUDA_CHECK(
+                    cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, {cudaMemLocationTypeDevice, cur_dev}));
+                TLLM_CUDA_CHECK(
+                    cudaMemAdvise(*ptr, size, cudaMemAdviseSetAccessedBy, {cudaMemLocationTypeDevice, cur_dev}));
+                TLLM_CUDA_CHECK(
+                    cudaMemAdvise(*ptr, size, cudaMemAdviseSetAccessedBy, {cudaMemLocationTypeHost, cudaCpuDeviceId}));
                 TLLM_CUDA_CHECK(cudaMemset(*ptr, 0, size));
                 return cudaSuccess;
             }

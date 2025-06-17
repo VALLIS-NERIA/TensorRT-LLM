@@ -126,9 +126,12 @@ void migrateToManaged(at::Tensor& tensor)
     // 3) advise to place on current GPU
     int cur_dev;
     TLLM_CUDA_CHECK(cudaGetDevice(&cur_dev));
-    TLLM_CUDA_CHECK(cudaMemAdvise(managed_ptr, byte_size, cudaMemAdviseSetPreferredLocation, cur_dev));
-    TLLM_CUDA_CHECK(cudaMemAdvise(managed_ptr, byte_size, cudaMemAdviseSetAccessedBy, cur_dev));
-    TLLM_CUDA_CHECK(cudaMemAdvise(managed_ptr, byte_size, cudaMemAdviseSetAccessedBy, cudaCpuDeviceId));
+    TLLM_CUDA_CHECK(cudaMemAdvise(managed_ptr, byte_size, cudaMemAdviseSetPreferredLocation,
+        cudaMemLocation{cudaMemLocationTypeDevice, cur_dev}));
+    TLLM_CUDA_CHECK(cudaMemAdvise(
+        managed_ptr, byte_size, cudaMemAdviseSetAccessedBy, cudaMemLocation{cudaMemLocationTypeDevice, cur_dev}));
+    TLLM_CUDA_CHECK(cudaMemAdvise(
+        managed_ptr, byte_size, cudaMemAdviseSetAccessedBy, cudaMemLocation{cudaMemLocationTypeHost, cudaCpuDeviceId}));
 
     // 4) copy old data to UVM
     TLLM_CUDA_CHECK(cudaMemcpy(managed_ptr, tensor.data_ptr(), byte_size, cudaMemcpyDeviceToDevice));
