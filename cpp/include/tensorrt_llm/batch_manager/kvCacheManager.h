@@ -117,6 +117,34 @@ std::list<std::vector<T>> chopVectorIntoBlocks(
     return blockedVectors;
 }
 
+enum class LinearCacheType : int8_t
+{
+    SSM_CONV_STATE,
+    INPUT_HIDDEN_STATES,
+};
+
+struct LinearAttentionMetadata
+{
+    std::vector<SizeType32> linearLayerIndices;
+    LinearCacheType cacheType;
+    SizeType32 bytesPerStep;  // SSM_CONV_STATE: ssm_state.bytes + conv_state.bytes
+                              // INPUT_HIDDEN_STATES: hidden_states.bytes (per token)
+    SizeType32 reuseSnapshotInterval;  // Only used for SSM_CONV_STATE
+
+    [[nodiscard]] SizeType32 getPageSizeInBytes(SizeType32 tokensPerBlock) const
+    {
+        switch (cacheType)
+        {
+        case LinearCacheType::SSM_CONV_STATE:
+            return bytesPerStep * tokensPerBlock;
+        case LinearCacheType::INPUT_HIDDEN_STATES:
+            return bytesPerStep;
+        default:
+            TLLM_THROW("Unsupported LinearCacheType %d", static_cast<int8_t>(cacheType));
+        }
+    }
+};
+
 struct TempAttentionWindowInputs
 {
     bool pagedContextFMHA;
@@ -1200,7 +1228,8 @@ public:
         bool copyOnPartialReuse = true,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false,
-        SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0);
+        SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0,
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     [[nodiscard]] bool isEnableIndexerKCache() const
     {
@@ -1561,7 +1590,7 @@ private:
     bool mIsVariableWindow;
     bool mIsVariableGQA;
 
-    std::map<SizeType32, WindowBlockManager> mWindowBlockManagers;
+    std::map<std::variant<SizeType32, LinearCacheType>, WindowBlockManager> mWindowBlockManagers;
     std::map<SizeType32, WindowSizeMetadata> mWindowSizeToMetadata;
     std::vector<SizeType32> mLayerToWindowSize;
     std::vector<SizeType32> mAbsolutePoolToWindowSize;
@@ -1578,6 +1607,7 @@ private:
     bool mIsEnableIndexerKCache{false};
     SizeType32 mIndexerKCacheQuantBlockSize{0};
     SizeType32 mIndexerKCacheIndexHeadDim{0};
+    std::optional<LinearAttentionMetadata> mLinearAttentionMetadata;
 };
 
 struct OffsetTableDimensions
@@ -1824,7 +1854,8 @@ public:
         bool copyOnpartialReuse = true,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
-        SizeType32 indexerKCacheIndexHeadDim = 0);
+        SizeType32 indexerKCacheIndexHeadDim = 0,
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1837,7 +1868,8 @@ public:
         bool copyOnpartialReuse = true,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
-        SizeType32 indexerKCacheIndexHeadDim = 0);
+        SizeType32 indexerKCacheIndexHeadDim = 0,
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1850,7 +1882,8 @@ public:
         bool copyOnpartialReuse = true,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
-        SizeType32 indexerKCacheIndexHeadDim = 0);
+        SizeType32 indexerKCacheIndexHeadDim = 0,
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1859,7 +1892,8 @@ public:
         SizeType32 sinkTokenLength, int64_t stream, SizeType32 maxSequenceLength, bool enableBlockReuse = false,
         bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true,
         bool copyOnpartialReuse = true, bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
-        SizeType32 indexerKCacheIndexHeadDim = 0);
+        SizeType32 indexerKCacheIndexHeadDim = 0,
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     ~KVCacheManager() override = default;
 

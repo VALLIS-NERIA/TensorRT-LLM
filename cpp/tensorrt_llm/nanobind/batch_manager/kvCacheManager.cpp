@@ -304,6 +304,12 @@ public:
 
 void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
 {
+    nb::class_<tbk::LinearAttentionMetadata>(m, "LinearAttentionMetadata")
+        .def(nb::init<>())
+        .def_rw("cache_type", &tbk::LinearAttentionMetadata::cacheType)
+        .def_rw("bytes_per_step", &tbk::LinearAttentionMetadata::bytesPerStep)
+        .def_rw("reuse_snapshot_interval", &tbk::LinearAttentionMetadata::reuseSnapshotInterval);
+
     nb::class_<tbk::KvCacheStats>(m, "KvCacheStats")
         .def(nb::init<>())
         .def_rw("max_num_blocks", &tbk::KvCacheStats::maxNumBlocks)
@@ -514,7 +520,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                  std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
                  nvinfer1::DataType, SizeType32, int64_t, runtime::SizeType32, bool, bool, tbk::CacheType,
                  std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
-                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>, bool, SizeType32, SizeType32>(),
+                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>, bool, SizeType32, SizeType32,
+                 std::optional<tbk::LinearAttentionMetadata>>(),
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window_vec"), nb::arg("temp_attention_window_inputs").none(), nb::arg("dtype"),
@@ -524,7 +531,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,
             nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr,
             nb::arg("enable_indexer_k_cache") = false, nb::arg("indexer_k_cache_quant_block_size") = 128,
-            nb::arg("indexer_k_cache_index_head_dim") = 0, nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("indexer_k_cache_index_head_dim") = 0, nb::arg("linear_attention_metadata").none(),
+            nb::call_guard<nb::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)
