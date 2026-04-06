@@ -2069,6 +2069,16 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                 }
                 block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
                 block->setPrevBlockInSeq(searchRoot);
+                if (!needMatch)
+                {
+                    auto const& rootNexts = searchRoot->getNextBlocks();
+                    if (rootNexts.find(blockKey) != rootNexts.end() && rootNexts.at(blockKey) != block)
+                    {
+                        // If blockKey has been a child, addNextBlock will have no effect. This occasionally happens on
+                        // placeholder blocks. Should be fixed.
+                        searchRoot->removeNextBlock(blockKey);
+                    }
+                }
                 searchRoot->addNextBlock(blockKey, block);
 
                 // Sanity check. The list of stored blocks should be connected.
