@@ -2074,8 +2074,8 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                     auto const& rootNexts = searchRoot->getNextBlocks();
                     if (rootNexts.find(blockKey) != rootNexts.end() && rootNexts.at(blockKey) != block)
                     {
-                        // If blockKey has been a child, addNextBlock will have no effect. This occasionally happens on
-                        // placeholder blocks. Should be fixed.
+                        // If blockKey has been a child, addNextBlock will have no effect. This may happen on
+                        // reused tailing placeholder blocks.
                         searchRoot->removeNextBlock(blockKey);
                     }
                 }

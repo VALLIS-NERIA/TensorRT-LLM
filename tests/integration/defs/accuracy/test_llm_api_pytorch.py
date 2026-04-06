@@ -6647,7 +6647,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
-                    enable_block_reuse=False,
+                    enable_block_reuse=True,
                     mamba_ssm_cache_dtype="float16",
                     mamba_state_cache_interval=mamba_state_cache_interval,
                     free_gpu_memory_fraction=0.8,

@@ -614,11 +614,6 @@ class KVCacheManager(BaseResourceManager):
     def get_max_resource_count(self) -> int:
         return self.impl.max_num_blocks
 
-    def get_num_blocks(self, window_size: int | None = None) -> Tuple[int, int]:
-        if window_size is None:
-            return (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
-        return self.blocks_per_window[window_size]
-
     def get_num_tokens(self, request: LlmRequest) -> int:
         # LlmRequest.get_num_tokens is out of sync with GenerationRequest when overlap scheduler is enabled.
         return self.impl.get_token_count(request.py_request_id)

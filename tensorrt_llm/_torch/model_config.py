@@ -813,7 +813,7 @@ class ModelConfig(Generic[TConfig]):
             spec_config: Optional['SpeculativeConfig'] = None):
         """Return the number of layers that need KV cache blocks.
 
-        For hybrid models using the V1 (MixedMambaHybridCacheManager) path
+        For hybrid models using the MixedMambaHybridCacheManager path
         (speculative decoding or TRTLLM_USE_CPP_MAMBA=1), only attention layers
         need KV cache blocks, so we return the attention-only count.
 
@@ -831,7 +831,6 @@ class ModelConfig(Generic[TConfig]):
             logger.warning(
                 "Block reuse does not work with MTP or disagg for hybrid linear models"
             )
-            use_reuse = False
         if is_nemotron_hybrid(self.pretrained_config) and use_v1_mamba_manager:
             return self.pretrained_config.hybrid_override_pattern.count("*")
         elif is_qwen3_hybrid(self.pretrained_config) and use_v1_mamba_manager:

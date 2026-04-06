@@ -1082,7 +1082,9 @@ def _create_kv_cache_manager(
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
         is_vswa = is_vswa_enabled(kv_cache_config)
         binding_model_config = _model_config.get_bindings_model_config(
-            tokens_per_block=tokens_per_block) if is_vswa else None
+            tokens_per_block=tokens_per_block,
+            kv_cache_config=kv_cache_config,
+            spec_config=spec_config) if is_vswa else None
 
         kv_cache_manager = kv_cache_manager_cls(
             kv_cache_config,
