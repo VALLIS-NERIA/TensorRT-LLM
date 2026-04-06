@@ -602,7 +602,7 @@ def create_py_executor(
 
     if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
         ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK,
-                            kv_cache_config.mamba_prefix_cache_step)
+                            kv_cache_config.mamba_state_cache_interval)
 
     guided_decoder: Optional[GuidedDecoder] = None
     if guided_decoding_config is not None:

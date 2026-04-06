@@ -791,10 +791,11 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager):
 
 def calc_context_stop_positions(prompt_len: int,
                                 tokens_per_block: int,
-                                mamba_prefix_cache_step: int,
+                                mamba_state_cache_interval: int,
                                 save_last_snapshot: bool = False) -> list[int]:
     stop_positions = list(
-        range(mamba_prefix_cache_step, prompt_len, mamba_prefix_cache_step))
+        range(mamba_state_cache_interval, prompt_len,
+              mamba_state_cache_interval))
     last_ckpt = prompt_len // tokens_per_block * tokens_per_block
     if save_last_snapshot and (last_ckpt not in stop_positions):
         stop_positions.append(last_ckpt)
@@ -873,7 +874,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         self.linear_attention_metadata = LinearAttentionMetadata()
         self.linear_attention_metadata.cache_type = LinearCacheType.RECURRENT_STATES.value
         self.linear_attention_metadata.all_recurrent_states_bytes = self.ssm_bytes + self.conv_bytes
-        self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_prefix_cache_step
+        self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_state_cache_interval
 
         if kv_cache_config.enable_partial_reuse:
             logger.warning(
@@ -917,17 +918,17 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
             is_estimating_kv_cache=is_estimating_kv_cache,
             linear_attention_metadata=self.linear_attention_metadata,
         )
-        self.linear_pp_layers, _ = get_pp_layers(
+        self.mamba_pp_layers, _ = get_pp_layers(
             mamba_num_layers,
             mapping,
             layer_mask=mamba_layer_mask,
         )
         idx = 0
-        self.linear_layer_offsets = {}
-        for layer_id in self.linear_pp_layers:
-            self.linear_layer_offsets[layer_id] = idx
+        self.mamba_layer_offsets = {}
+        for layer_id in self.mamba_pp_layers:
+            self.mamba_layer_offsets[layer_id] = idx
             idx += 1
-        self.num_linear_layers = mamba_num_layers
+        self.num_mamba_layers = mamba_num_layers
         self.host_block_offsets = torch.zeros([
             self.impl.num_pools, self.max_batch_size, 2, self.max_blocks_per_seq
         ],
@@ -935,7 +936,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                                               device="cpu")
         self.requests = []
         self.recurrent_states_pool_index = self.kv_cache_pool_mapping[
-            self.layer_offsets[self.linear_pp_layers[0]]][0]
+            self.layer_offsets[self.mamba_pp_layers[0]]][0]
         self._cuda_state_indices = torch.zeros([self.max_batch_size],
                                                dtype=torch.int32,
                                                device="cuda")
@@ -943,7 +944,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
 
         self.ssm_states_mapping = {}
         self.conv_states_mapping = {}
-        for layer_id in self.linear_pp_layers:
+        for layer_id in self.mamba_pp_layers:
             ssm_states = self._get_ssm_states(layer_id)
             conv_states = self._get_conv_states(layer_id)
             self.ssm_states_mapping[layer_id] = ssm_states
@@ -1053,12 +1054,12 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         self.impl.copy_batch_block_offsets(
             self.host_block_offsets,
             [req.py_request_id for req in self.requests], 1, 0)
-        host_linear_block_offsets = torch.zeros([len(self.requests)],
-                                                dtype=torch.int32,
-                                                device="cpu")
+        host_block_offsets = torch.zeros([len(self.requests)],
+                                         dtype=torch.int32,
+                                         device="cpu")
         for i in range(len(self.requests)):
             # With layer-first pool layout, setOffsets produces the block index directly
-            # (no longer multiplied by num_linear_layers)
+            # (no longer multiplied by num_mamba_layers)
             value = self.host_block_offsets[self.recurrent_states_pool_index, i,
                                             0, block_indices[i]]
             max_blocks = self.blocks_per_window[
@@ -1067,12 +1068,12 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                 raise RuntimeError(
                     f"Invalid recurrent state block index {value} "
                     f"(expected 0 <= index < {max_blocks}) for request {i}")
-            host_linear_block_offsets[i] = value
+            host_block_offsets[i] = value
 
         torch.fill_(self._cuda_state_indices, 0)
-        self._cuda_state_indices[:len(self.requests
-                                      )] = host_linear_block_offsets.cuda()
-        self._host_state_indices = host_linear_block_offsets.clone()
+        self._cuda_state_indices[:len(self.requests)] = host_block_offsets.cuda(
+        )
+        self._host_state_indices = host_block_offsets.clone()
 
     def get_state_indices(
             self,
@@ -1084,7 +1085,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         """Compute the next prefill chunk size for a context request when block reuse is enabled.
 
         When kv_cache_config.enable_block_reuse is True, context prefill must stop exactly at
-        the positions returned by calc_context_stop_positions (mamba_prefix_cache_step boundaries
+        the positions returned by calc_context_stop_positions (mamba_state_cache_interval boundaries
         and block boundaries). This returns the chunk_size to use for the next prefill step so
         that the next stop position is not exceeded.
 
@@ -1120,8 +1121,8 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                 f"ssm_state_dtype size ({self.ssm_state_dtype.itemsize})")
         # Pool layout: {numLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
         pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
-            torch.uint8).reshape(self.num_linear_layers, -1, total_bytes)
-        layer_offset = self.linear_layer_offsets[layer_idx]
+            torch.uint8).reshape(self.num_mamba_layers, -1, total_bytes)
+        layer_offset = self.mamba_layer_offsets[layer_idx]
         # layer_pool: {numBlocks, ssm_bytes + conv_bytes}, contiguous
         layer_pool = pool[layer_offset]
         flat = layer_pool.view(self.ssm_state_dtype)
@@ -1153,8 +1154,8 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                 f"conv_state_dtype size ({self.conv_state_dtype.itemsize})")
         # Pool layout: {numLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
         pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
-            torch.uint8).reshape(self.num_linear_layers, -1, total_bytes)
-        layer_offset = self.linear_layer_offsets[layer_idx]
+            torch.uint8).reshape(self.num_mamba_layers, -1, total_bytes)
+        layer_offset = self.mamba_layer_offsets[layer_idx]
         # layer_pool: {numBlocks, ssm_bytes + conv_bytes}, contiguous
         layer_pool = pool[layer_offset]
         flat = layer_pool.view(self.conv_state_dtype)
@@ -1176,7 +1177,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
 
 class _MambaHybridCacheManagerMeta(type):
     """Metaclass that enables isinstance/issubclass checks against
-    MambaHybridCacheManager for both V1 and Linear implementations."""
+    MambaHybridCacheManager for both Mixed and Cpp implementations."""
 
     def __instancecheck__(cls, instance):
         if cls is MambaHybridCacheManager:

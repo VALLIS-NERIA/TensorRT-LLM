@@ -227,7 +227,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.mapping = mapping
 
         self.attn_tp_rank = mapping.tp_rank
-        self.attn_tp_size = 1 if model_config.mapping.enable_attention_dp else mapping.tp_size
+        self.attn_tp_size = mapping.tp_size
         self.hidden_size = config.hidden_size
         self.num_v_heads = config.linear_num_value_heads
         self.num_k_heads = config.linear_num_key_heads
@@ -749,8 +749,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         state_indices_p, state_indices_d = torch.split(state_indices, batch_split_size)
         if num_prefills > 0:
-            ssm_states[state_indices_p] = torch.zeros(
+            has_initial_states_p = has_initial_states[:num_prefills]
+            ssm_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
                 (), dtype=ssm_states.dtype, device=ssm_states.device
+            )
+            conv_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
+                (), dtype=conv_states.dtype, device=conv_states.device
             )
 
         is_target_verify = (

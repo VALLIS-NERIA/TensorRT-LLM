@@ -5892,27 +5892,35 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"],
                              ids=["cutlass", "trtllm"])
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp", [
-            (1, 1, 1, True, True, False),
-            (4, 1, 1, True, True, False),
-            (4, 1, 4, True, True, True),
-            (4, 1, 4, True, True, False),
-            (4, 1, 4, False, False, False),
+        "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp,enable_block_reuse",
+        [
+            (1, 1, 1, True, True, False, True),
+            (1, 1, 1, True, True, False, False),
+            (4, 1, 1, True, True, False, False),
+            (4, 1, 4, True, True, True, False),
+            (4, 1, 4, True, True, False, False),
+            (4, 1, 4, False, False, False, False),
         ],
         ids=[
-            "tp1", "tp4ep1", "tp4ep4_adp_on", "tp4ep4_adp_off",
-            "no_cuda_graph_overlap"
+            "tp1_block_reuse", "tp1", "tp4ep1", "tp4ep4_adp_on",
+            "tp4ep4_adp_off", "no_cuda_graph_overlap"
         ])
     def test_nvfp4(self, moe_backend, tp_size, pp_size, ep_size, cuda_graph,
-                   overlap_scheduler, attention_dp, mocker):
+                   overlap_scheduler, attention_dp, enable_block_reuse, mocker):
+        gpu_needed = max(tp_size, ep_size) * pp_size
+        if get_device_count() < gpu_needed:
+            pytest.skip(
+                f"Device count {get_device_count()} is less than required {gpu_needed}"
+            )
         model_path = f"{self.MODEL_PATH}/qwen3-next-80b-instruct-nvfp4-ptq-fp8kv"
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=enable_block_reuse)
+        if enable_block_reuse:
+            kv_cache_config.mamba_state_cache_interval = 256
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig(
                                   max_batch_size=512, enable_padding=False)
@@ -6626,7 +6634,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.parametrize(
-        "tp_size, ep_size, mamba_prefix_cache_step, attention_dp",
+        "tp_size, ep_size, mamba_state_cache_interval, attention_dp",
         [
             (4, 1, 256, False),
             (4, 4, 512, False),
@@ -6635,13 +6643,13 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         ids=["TP4", "TEP4", "TP4_ADP"],
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
-                                     mamba_prefix_cache_step, attention_dp):
+                                     mamba_state_cache_interval, attention_dp):
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
-                    mamba_prefix_cache_step=mamba_prefix_cache_step,
+                    mamba_state_cache_interval=mamba_state_cache_interval,
                     free_gpu_memory_fraction=0.8,
                 ),
                 max_batch_size=32,

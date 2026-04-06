@@ -2283,7 +2283,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                                   description="The number of tokens per block.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    mamba_prefix_cache_step: int = Field(
+    mamba_state_cache_interval: int = Field(
         default=256,
         description=
         "The number of tokens between cache steps in the Mamba prefix cache.")

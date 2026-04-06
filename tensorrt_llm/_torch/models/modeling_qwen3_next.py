@@ -247,10 +247,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         return final_hidden_states.view(orig_shape)
 
 
-# Qwen3NextGatedDeltaNet lives in gdn_mixer.py (moved there by a prior PR).
-# Do NOT duplicate it here.
-
-
 class _DenseMlpAdapter(nn.Module):
     """Wraps GatedMLP to match Qwen3NextSparseMoeBlock's forward interface.
 
