@@ -494,34 +494,9 @@ void KVCacheBlock::detachDescendantsFromLookupTree()
     }
 }
 
-void KVCacheBlock::detachPreviousPlaceholdersFromLookupTree() const
-{
-    BlockPtr current = getPrevBlock();
-    while (current != nullptr && current->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
-    {
-        if (!current->isPlaceholder())
-        {
-            return;
-        }
-        auto siblings = current->getNextBlocks();
-        for (auto const& [key, block] : siblings)
-        {
-            if (!block->isPlaceholder() && block.get() != this)
-            {
-                return;
-            }
-        }
-        BlockPtr prev = current->getPrevBlock();
-        current->detachFromLookupNode();
-        current->setPrevBlockInSeq(nullptr);
-        current = prev;
-    }
-}
-
 void KVCacheBlock::freeBlockAndAllDescendants()
 {
     detachDescendantsFromLookupTree();
-    detachPreviousPlaceholdersFromLookupTree();
     detachFromLookupNode();
 }
 
@@ -2093,21 +2068,6 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                 }
                 block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
                 block->setPrevBlockInSeq(searchRoot);
-                if (!needMatch)
-                {
-                    auto const& rootNexts = searchRoot->getNextBlocks();
-                    if (rootNexts.find(blockKey) != rootNexts.end() && rootNexts.at(blockKey) != block)
-                    {
-                        // Regarding `blockKey`, `searchRoot` is expected to have either no child or `block` as a child.
-                        // In some unclear cases `searchRoot` has a child but it's not `block`. By design,
-                        // `addNextBlock` ignores `block` completely so that `block` is not attached to the
-                        // lookup tree. This further causes this function to mess up with remaining blocks.
-
-                        // Here, we forcibly make `block` child of `searchRoot` to match the expected behavior,
-                        // as a workaround before the root cause is found.
-                        searchRoot->removeNextBlock(blockKey);
-                    }
-                }
                 searchRoot->addNextBlock(blockKey, block);
 
                 // Sanity check. The list of stored blocks should be connected.
