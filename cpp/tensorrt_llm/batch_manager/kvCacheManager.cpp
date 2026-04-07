@@ -2098,8 +2098,13 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                     auto const& rootNexts = searchRoot->getNextBlocks();
                     if (rootNexts.find(blockKey) != rootNexts.end() && rootNexts.at(blockKey) != block)
                     {
-                        // If blockKey has been a child, addNextBlock will have no effect. This may happen on
-                        // reused tailing placeholder blocks.
+                        // Regarding `blockKey`, `searchRoot` is expected to have either no child or `block` as a child.
+                        // In some unclear cases `searchRoot` has a child but it's not `block`. By design,
+                        // `addNextBlock` ignores `block` completely so that `block` is not attached to the
+                        // lookup tree. This further causes this function to mess up with remaining blocks.
+
+                        // Here, we forcibly make `block` child of `searchRoot` to match the expected behavior,
+                        // as a workaround before the root cause is found.
                         searchRoot->removeNextBlock(blockKey);
                     }
                 }
