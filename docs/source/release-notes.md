@@ -9,7 +9,7 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Highlights
 
 - **Fixed Issue**
-  - Fixed an issue that causes KV cache corruption (#12770)
+  - Fixed an issue that caused KV cache corruption (#12770)
 
 - **Infrastructure Changes**
   - Upgraded xgrammar and flashinfer (#12811)
