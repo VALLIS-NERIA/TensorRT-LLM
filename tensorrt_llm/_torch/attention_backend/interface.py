@@ -305,8 +305,7 @@ class AttentionMetadata:
             return
 
         if self.mamba_metadata is None:
-            if (self.kv_cache_manager is not None and isinstance(
-                    self.kv_cache_manager, BaseMambaCacheManager)):
+            if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
                 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
                 self.mamba_metadata = Mamba2Metadata(self.max_num_requests,
                                                      self.mamba_chunk_size)

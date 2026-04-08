@@ -11,7 +11,6 @@ import torch
 import transformers
 from transformers.utils import HF_MODULES_CACHE
 
-from tensorrt_llm import logger
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_qwen3_hybrid_num_attention_layers, is_hybrid_linear, is_nemotron_hybrid,
     is_qwen3_hybrid, load_pretrained_config)

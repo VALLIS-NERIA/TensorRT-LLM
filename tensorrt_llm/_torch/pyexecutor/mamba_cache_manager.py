@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from functools import reduce
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
@@ -65,23 +65,30 @@ def use_cpp_mamba_cache_manager() -> bool:
 
 
 class BaseMambaCacheManager(ABC):
-    """Abstract interface for accessing mamba/recurrent state caches.
-
-    Implemented by MambaCacheManager (standalone mamba-only models) and
-    CppMambaHybridCacheManager (hybrid attention+mamba models). Use
-    ``isinstance(mgr, BaseMambaCacheManager)`` to check for mamba capability.
-    """
+    """Abstract interface for accessing mamba/recurrent state caches."""
 
     @abstractmethod
     def get_state_indices(self, *args, **kwargs) -> torch.Tensor:
+        """Return slot indices of each request.
+
+        Shape: [max_batch_size]
+        """
         ...
 
     @abstractmethod
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
+        """Return conv states for specific layer.
+
+        Shape: [slot_size, conv_dim, d_conv - 1]
+        """
         ...
 
     @abstractmethod
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
+        """Return SSM states for specific layer.
+
+        Shape: [slot_size, num_heads, head_dim, d_state]
+        """
         ...
 
     @abstractmethod
@@ -93,13 +100,11 @@ class BaseMambaCacheManager(ABC):
         ...
 
     @abstractmethod
-    def mamba_layer_cache(self, layer_idx: int):
+    def mamba_layer_cache(
+        self, layer_idx: int
+    ) -> Union['PythonMambaCacheManager.State',
+               'PythonMambaCacheManager.SpeculativeState', None]:
         ...
-
-    def reorder_state_indices_when_padding_requests(self, request_size: int,
-                                                    padding_size: int):
-        """Ensure padding slots use distinct state indices. No-op by default;
-        overridden by PythonMambaCacheManager which manages its own index pool."""
 
 
 class CppMambaCacheManager(BaseResourceManager):
@@ -793,6 +798,11 @@ def calc_context_stop_positions(prompt_len: int,
                                 tokens_per_block: int,
                                 mamba_state_cache_interval: int,
                                 save_last_snapshot: bool = False) -> list[int]:
+    """Compute token positions at which mamba state snapshots should be saved.
+
+    Returns positions spaced by ``mamba_state_cache_interval`` plus the final
+    prompt length (and optionally the last block-aligned position).
+    """
     stop_positions = list(
         range(mamba_state_cache_interval, prompt_len,
               mamba_state_cache_interval))
@@ -864,12 +874,26 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
         self.ssm_state_dtype = mamba_ssm_cache_dtype
         self.conv_state_dtype = mamba_cache_dtype
-        self.ssm_count = reduce(lambda x, y: x * y, self.ssm_state_shape)
-        self.conv_count = reduce(lambda x, y: x * y, self.conv_state_shape)
+        self.ssm_count = math.prod(self.ssm_state_shape)
+        self.conv_count = math.prod(self.conv_state_shape)
         self.ssm_bytes = self.ssm_count * self.ssm_state_dtype.itemsize
         self.conv_bytes = self.conv_count * self.conv_state_dtype.itemsize
         # round conv_bytes to 1KB
         self.conv_bytes = ((self.conv_bytes + 1023) // 1024) * 1024
+
+        total_bytes = self.ssm_bytes + self.conv_bytes
+        if total_bytes % self.ssm_state_dtype.itemsize != 0:
+            raise RuntimeError(
+                f"Total state bytes ({total_bytes}) not divisible by "
+                f"ssm_state_dtype size ({self.ssm_state_dtype.itemsize})")
+        if total_bytes % self.conv_state_dtype.itemsize != 0:
+            raise RuntimeError(
+                f"Total state bytes ({total_bytes}) not divisible by "
+                f"conv_state_dtype size ({self.conv_state_dtype.itemsize})")
+        if self.ssm_bytes % self.conv_state_dtype.itemsize != 0:
+            raise RuntimeError(
+                f"SSM state bytes ({self.ssm_bytes}) not divisible by "
+                f"conv_state_dtype size ({self.conv_state_dtype.itemsize})")
 
         self.linear_attention_metadata = LinearAttentionMetadata()
         self.linear_attention_metadata.cache_type = LinearCacheType.RECURRENT_STATES.value
@@ -887,7 +911,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         kv_cache_config.max_attention_window = []
         layer_mask = [
             mamba_layer_mask[i] or full_attention_layer_mask[i]
-            for i, _ in enumerate(mamba_layer_mask)
+            for i in range(len(mamba_layer_mask))
         ]
         for i in range(len(layer_mask)):
             if layer_mask[i]:
@@ -923,11 +947,9 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
             mapping,
             layer_mask=mamba_layer_mask,
         )
-        idx = 0
         self.mamba_layer_offsets = {}
-        for layer_id in self.mamba_pp_layers:
+        for idx, layer_id in enumerate(self.mamba_pp_layers):
             self.mamba_layer_offsets[layer_id] = idx
-            idx += 1
         self.num_mamba_layers = mamba_num_layers
         self.host_block_offsets = torch.zeros([
             self.impl.num_pools, self.max_batch_size, 2, self.max_blocks_per_seq
@@ -937,18 +959,16 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         self.requests = []
         self.recurrent_states_pool_index = self.kv_cache_pool_mapping[
             self.layer_offsets[self.mamba_pp_layers[0]]][0]
-        self._cuda_state_indices = torch.zeros([self.max_batch_size],
-                                               dtype=torch.int32,
-                                               device="cuda")
+        self.cuda_state_indices = torch.zeros([self.max_batch_size],
+                                              dtype=torch.int32,
+                                              device="cuda")
         self.kv_cache_config = kv_cache_config
 
         self.ssm_states_mapping = {}
         self.conv_states_mapping = {}
         for layer_id in self.mamba_pp_layers:
-            ssm_states = self._get_ssm_states(layer_id)
-            conv_states = self._get_conv_states(layer_id)
-            self.ssm_states_mapping[layer_id] = ssm_states
-            self.conv_states_mapping[layer_id] = conv_states
+            self.ssm_states_mapping[layer_id] = self._get_ssm_states(layer_id)
+            self.conv_states_mapping[layer_id] = self._get_conv_states(layer_id)
 
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
@@ -1070,16 +1090,15 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                     f"(expected 0 <= index < {max_blocks}) for request {i}")
             host_block_offsets[i] = value
 
-        torch.fill_(self._cuda_state_indices, 0)
-        self._cuda_state_indices[:len(self.requests)] = host_block_offsets.cuda(
-        )
+        torch.fill_(self.cuda_state_indices, 0)
+        self.cuda_state_indices[:len(self.requests)] = host_block_offsets.cuda()
         self._host_state_indices = host_block_offsets.clone()
 
     def get_state_indices(
             self,
             request_ids: Optional[List[int]] = None,
             is_padding: Optional[List[bool]] = None) -> torch.Tensor:
-        return self._cuda_state_indices
+        return self.cuda_state_indices
 
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
         """Compute the next prefill chunk size for a context request when block reuse is enabled.
@@ -1115,10 +1134,6 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
     # [total_block_num, *ssm_state_shape] (one block for one layer)
     def _get_ssm_states(self, layer_idx: int) -> torch.Tensor:
         total_bytes = self.ssm_bytes + self.conv_bytes
-        if total_bytes % self.ssm_state_dtype.itemsize != 0:
-            raise RuntimeError(
-                f"Total state bytes ({total_bytes}) not divisible by "
-                f"ssm_state_dtype size ({self.ssm_state_dtype.itemsize})")
         # Pool layout: {numLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
         pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
             torch.uint8).reshape(self.num_mamba_layers, -1, total_bytes)
@@ -1144,14 +1159,6 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
 
     def _get_conv_states(self, layer_idx: int) -> torch.Tensor:
         total_bytes = self.ssm_bytes + self.conv_bytes
-        if total_bytes % self.conv_state_dtype.itemsize != 0:
-            raise RuntimeError(
-                f"Total state bytes ({total_bytes}) not divisible by "
-                f"conv_state_dtype size ({self.conv_state_dtype.itemsize})")
-        if self.ssm_bytes % self.conv_state_dtype.itemsize != 0:
-            raise RuntimeError(
-                f"SSM state bytes ({self.ssm_bytes}) not divisible by "
-                f"conv_state_dtype size ({self.conv_state_dtype.itemsize})")
         # Pool layout: {numLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
         pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
             torch.uint8).reshape(self.num_mamba_layers, -1, total_bytes)
