@@ -813,18 +813,17 @@ class ModelConfig(Generic[TConfig]):
         """Return the number of layers that need KV cache blocks.
 
         For hybrid models using the MixedMambaHybridCacheManager path
-        (speculative decoding or TRTLLM_USE_CPP_MAMBA=1), only attention layers
-        need KV cache blocks, so we return the attention-only count.
+        (TRTLLM_USE_CPP_MAMBA=1 for disagg), only attention layers need KV
+        cache blocks, so we return the attention-only count.
 
-        For the default CppMambaHybridCacheManager path, both attention and
-        mamba layers are managed in the unified KV cache pool, so we return
-        num_hidden_layers (all layers).
+        For the default CppMambaHybridCacheManager path (including speculative
+        decoding), both attention and mamba layers are managed in the unified
+        KV cache pool, so we return num_hidden_layers (all layers).
         """
         use_disagg = os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
         use_reuse = kv_cache_config is not None and kv_cache_config.enable_block_reuse
-        use_spec = spec_config is not None
 
-        use_v1_mamba_manager = use_disagg or use_spec
+        use_v1_mamba_manager = use_disagg
         if is_hybrid_linear(
                 self.pretrained_config) and use_v1_mamba_manager and use_reuse:
             logger.warning(

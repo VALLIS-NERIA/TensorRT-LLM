@@ -964,19 +964,15 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                                               device="cuda")
         self.kv_cache_config = kv_cache_config
 
-        self.ssm_states_mapping = {}
-        self.conv_states_mapping = {}
-        for layer_id in self.mamba_pp_layers:
-            self.ssm_states_mapping[layer_id] = self._get_ssm_states(layer_id)
-            self.conv_states_mapping[layer_id] = self._get_conv_states(layer_id)
+        self._setup_states_views()
 
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
     def shutdown(self):
         # Release tensor views into the pool before the pool memory is freed,
         # so their deleters don't see stale pointers.
-        self.ssm_states_mapping = None
-        self.conv_states_mapping = None
+        self.all_ssm_states = None
+        self.all_conv_states = None
         super().shutdown()
 
     def add_dummy_requests(
@@ -1043,16 +1039,16 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         )
 
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
-        return self.ssm_states_mapping[layer_idx]
+        return self.all_ssm_states[self.mamba_layer_offsets[layer_idx]]
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
-        return self.conv_states_mapping[layer_idx]
+        return self.all_conv_states[self.mamba_layer_offsets[layer_idx]]
 
     def mamba_layer_cache(
             self, layer_idx: int) -> Union[PythonMambaCacheManager.State, None]:
         ret = PythonMambaCacheManager.State(
-            conv=self.conv_states_mapping[layer_idx],
-            temporal=self.ssm_states_mapping[layer_idx])
+            conv=self.get_conv_states(layer_idx),
+            temporal=self.get_ssm_states(layer_idx))
         return ret
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
@@ -1131,52 +1127,22 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                 return pos - current
         return prompt_len - current
 
-    # [total_block_num, *ssm_state_shape] (one block for one layer)
-    def _get_ssm_states(self, layer_idx: int) -> torch.Tensor:
-        total_bytes = self.ssm_bytes + self.conv_bytes
+    def _setup_states_views(self) -> None:
         # Pool layout: {numLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
         pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
-            torch.uint8).reshape(self.num_mamba_layers, -1, total_bytes)
-        layer_offset = self.mamba_layer_offsets[layer_idx]
-        # layer_pool: {numBlocks, ssm_bytes + conv_bytes}, contiguous
-        layer_pool = pool[layer_offset]
-        flat = layer_pool.view(self.ssm_state_dtype)
-        assert flat.data_ptr() == layer_pool.data_ptr()
-        total_elems_per_block = (
-            self.ssm_bytes + self.conv_bytes) // self.ssm_state_dtype.itemsize
-        target_shape = [flat.shape[0], *self.ssm_state_shape]
-        target_strides = [
-            total_elems_per_block,
-            self.ssm_state_shape[1] * self.ssm_state_shape[2],
-            self.ssm_state_shape[2],
-            1,
-        ]
-        my_ssm_states = torch.as_strided(flat,
-                                         target_shape,
-                                         target_strides,
-                                         storage_offset=flat.storage_offset())
-        return my_ssm_states
-
-    def _get_conv_states(self, layer_idx: int) -> torch.Tensor:
-        total_bytes = self.ssm_bytes + self.conv_bytes
-        # Pool layout: {numLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
-        pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
-            torch.uint8).reshape(self.num_mamba_layers, -1, total_bytes)
-        layer_offset = self.mamba_layer_offsets[layer_idx]
-        # layer_pool: {numBlocks, ssm_bytes + conv_bytes}, contiguous
-        layer_pool = pool[layer_offset]
-        flat = layer_pool.view(self.conv_state_dtype)
-        assert flat.data_ptr() == layer_pool.data_ptr()
-        total_elems_per_block = total_bytes // self.conv_state_dtype.itemsize
-        offset = self.ssm_bytes // self.conv_state_dtype.itemsize
-        target_shape = [flat.shape[0], *self.conv_state_shape]
-        target_strides = [total_elems_per_block, self.conv_state_shape[-1], 1]
-        my_conv_states = torch.as_strided(flat,
-                                          target_shape,
-                                          target_strides,
-                                          storage_offset=offset +
-                                          flat.storage_offset())
-        return my_conv_states
+            torch.uint8).reshape(self.num_mamba_layers, -1,
+                                 self.ssm_bytes + self.conv_bytes)
+        num_blocks_in_pool = pool.shape[1]
+        self.all_ssm_states = pool[:, :, :self.ssm_bytes].view(
+            self.ssm_state_dtype).view(
+                [self.num_mamba_layers, num_blocks_in_pool] +
+                self.ssm_state_shape)
+        self.all_conv_states = pool[:, :, self.ssm_bytes:self.ssm_bytes +
+                                    self.conv_bytes].view(
+                                        self.conv_state_dtype).view([
+                                            self.num_mamba_layers,
+                                            num_blocks_in_pool
+                                        ] + self.conv_state_shape)
 
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self.ssm_state_dtype
