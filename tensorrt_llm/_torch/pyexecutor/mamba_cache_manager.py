@@ -878,8 +878,6 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         self.conv_count = math.prod(self.conv_state_shape)
         self.ssm_bytes = self.ssm_count * self.ssm_state_dtype.itemsize
         self.conv_bytes = self.conv_count * self.conv_state_dtype.itemsize
-        # round conv_bytes to 1KB
-        self.conv_bytes = ((self.conv_bytes + 1023) // 1024) * 1024
 
         total_bytes = self.ssm_bytes + self.conv_bytes
         if total_bytes % self.ssm_state_dtype.itemsize != 0:
