@@ -537,13 +537,18 @@ class PyTorchModelEngine(ModelEngine):
             max_lora_size = lora_config.max_loras or 8  # Default fallback
             max_batch_size = self.batch_size  # Use engine's max batch size
 
+            # For spec decode, each generation request contributes
+            # max_draft_len + 1 tokens per forward pass.
+            max_tokens_per_seq = (self.original_max_draft_len +
+                                  1) if self.is_spec_decode else 1
             self.cuda_graph_lora_manager = CudaGraphLoraManager(
                 max_lora_size=max_lora_size,
                 max_batch_size=max_batch_size,
                 max_lora_rank=lora_config.max_lora_rank,
                 model=self.model,
                 lora_model_config=self.lora_model_config,
-                device='cuda')
+                device='cuda',
+                max_tokens_per_seq=max_tokens_per_seq)
 
             logger.info(
                 f"Initialized CUDA Graph LoRA manager, "
@@ -1297,10 +1302,10 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
         draft_kv_cache_manager: Optional[Union[KVCacheManager,
                                                KVCacheManagerV2]] = None):
-        enable_context_mla_with_cached_kv = is_mla(
-            self.model.model_config.pretrained_config) and (
-                self.attn_runtime_features.cache_reuse
-                or self.attn_runtime_features.chunked_prefill)
+        is_mla_enable = is_mla(self.model.model_config.pretrained_config)
+        enable_context_mla_with_cached_kv = is_mla_enable and (
+            self.attn_runtime_features.cache_reuse
+            or self.attn_runtime_features.chunked_prefill)
         cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
         num_attention_heads = getattr(self.model.model_config.pretrained_config,
                                       'num_attention_heads', None)
@@ -1327,6 +1332,7 @@ class PyTorchModelEngine(ModelEngine):
                 kv_cache_manager=None,
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
+                is_mla_enable=is_mla_enable,
                 enable_flash_mla=self.model.model_config.enable_flash_mla,
                 enable_context_mla_with_cached_kv=
                 enable_context_mla_with_cached_kv,
@@ -1348,6 +1354,7 @@ class PyTorchModelEngine(ModelEngine):
             draft_kv_cache_manager=draft_kv_cache_manager,
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
+            is_mla_enable=is_mla_enable,
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             cache_indirection=cache_indirection,
@@ -3458,8 +3465,17 @@ class PyTorchModelEngine(ModelEngine):
         use_cuda_graph_mode = self.cuda_graph_lora_manager is not None and maybe_graph
 
         if use_cuda_graph_mode:
+            # For spec decode verification (non-extend_ctx), each sequence has
+            # runtime_draft_len + 1 tokens in the forward pass.
+            tokens_per_seq = 1
+            if (self.enable_spec_decode and self.runtime_draft_len > 0
+                    and self.spec_config.is_linear_tree
+                    and not self.spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend)):
+                tokens_per_seq = self.runtime_draft_len + 1
             return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
-                scheduled_requests, attn_metadata, peft_cache_manager)
+                scheduled_requests, attn_metadata, peft_cache_manager,
+                tokens_per_seq)
         else:
             if self.cuda_graph_lora_manager is not None:
                 self.cuda_graph_lora_manager.adapter_slot_manager.remove_evicted_slots_in_cpp(
@@ -3560,9 +3576,31 @@ class PyTorchModelEngine(ModelEngine):
                     current_lora_params['weight_pointers'])
 
         if lora_params:
-            lora_params['host_request_types'] = attn_metadata.host_request_types
-            lora_params['prompt_lens_cpu'] = attn_metadata.prompt_lens_cpu
-            lora_params['num_seqs'] = attn_metadata.num_seqs
+            host_request_types = attn_metadata.host_request_types
+            prompt_lens_cpu = attn_metadata.prompt_lens_cpu
+            num_seqs = attn_metadata.num_seqs
+            num_contexts = attn_metadata.num_contexts
+            num_generations = attn_metadata.num_generations
+
+            # During spec decode verification (non-extend_ctx mode), each
+            # generation request processes (runtime_draft_len + 1) tokens at
+            # once. The LoRA op's C++ kernel only advances 1 token per
+            # kGENERATION request, so we re-label generation requests as
+            # kCONTEXT and set prompt_lens_cpu to the actual per-request token
+            # count so the kernel correctly expands LoRA weights for all tokens.
+            if (self.enable_spec_decode and self.runtime_draft_len > 0
+                    and self.spec_config.is_linear_tree
+                    and not self.spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend) and num_generations > 0):
+                tokens_per_req = self.runtime_draft_len + 1
+                host_request_types = host_request_types.clone()
+                host_request_types[num_contexts:num_seqs].fill_(0)  # kCONTEXT
+                prompt_lens_cpu = prompt_lens_cpu.clone()
+                prompt_lens_cpu[num_contexts:num_seqs].fill_(tokens_per_req)
+
+            lora_params['host_request_types'] = host_request_types
+            lora_params['prompt_lens_cpu'] = prompt_lens_cpu
+            lora_params['num_seqs'] = num_seqs
 
         return lora_params
 
