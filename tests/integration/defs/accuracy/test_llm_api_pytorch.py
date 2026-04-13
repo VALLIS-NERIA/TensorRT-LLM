@@ -5786,29 +5786,31 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
-        "tp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp, moe_backend",
+        "tp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp,moe_backend,enable_block_reuse",
         [
-            (4, 4, True, True, False, "CUTEDSL"),
-            (4, 4, True, True, True, "CUTEDSL"),
-            (4, 4, True, True, False, "TRTLLM"),
-            (4, 4, True, True, True, "TRTLLM"),
+            (4, 4, True, True, False, "CUTEDSL", False),
+            (4, 4, True, True, True, "CUTEDSL", False),
+            (4, 4, True, True, False, "TRTLLM", False),
+            (4, 4, True, True, True, "TRTLLM", False),
+            (4, 4, True, True, False, "CUTEDSL", True),
         ],
         ids=[
             "tep4_cutedsl",
             "adp4_cutedsl",
             "tep4_trtllm",
             "adp4_trtllm",
+            "tep4_block_reuse",
         ],
     )
     def test_nvfp4(self, tp_size, ep_size, cuda_graph, overlap_scheduler,
-                   attention_dp, moe_backend, mocker):
+                   attention_dp, moe_backend, enable_block_reuse, mocker):
         model_path = f"{llm_models_root()}/Qwen3.5-397B-A17B-NVFP4"
 
         if not os.path.exists(model_path):
             pytest.skip(f"Model directory {model_path} does not exist")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=enable_block_reuse)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig(
                                   max_batch_size=32, enable_padding=False)
@@ -6414,11 +6416,12 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size, ep_size, mamba_state_cache_interval, attention_dp",
         [
+            (1, 1, 256, False),
             (4, 1, 256, False),
             (4, 4, 512, False),
             (4, 4, 256, True),
         ],
-        ids=["TP4", "TEP4", "TEP4_ADP"],
+        ids=["TP1", "TP4", "TEP4", "TEP4_ADP"],
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      mamba_state_cache_interval, attention_dp):
