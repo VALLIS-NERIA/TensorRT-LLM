@@ -108,6 +108,7 @@ add_library(
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   specDecOp.cpp
+  dynamicTreeOp.cpp
   loraOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp
   tinygemm2.cpp
@@ -123,7 +124,6 @@ target_link_libraries(
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common
                              PUBLIC "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")
-  message(STATUS "Enable open source Cutlass low latency gemm kernel")
 endif()
 
 if(USING_OSS_CUTLASS_FP4_GEMM)
