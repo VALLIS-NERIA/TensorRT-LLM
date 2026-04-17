@@ -95,6 +95,7 @@ class KvCacheCreator:
         speculative_config: SpeculativeConfig,
         sparse_attention_config: SparseAttentionConfig,
         profiling_stage_data: Optional[dict],
+        is_disagg: bool,
         execution_stream: Optional[torch.cuda.Stream] = None,
         draft_config: Optional[ModelConfig] = None,
         skip_est: bool = False,
@@ -118,6 +119,7 @@ class KvCacheCreator:
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
         self._profiling_stage_data = profiling_stage_data
+        self._is_disagg = is_disagg
         self._kv_cache_manager_cls = get_kv_cache_manager_cls(
             model_engine.model.model_config, kv_cache_config)
         self._execution_stream = execution_stream
@@ -574,6 +576,7 @@ class KvCacheCreator:
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
+            is_disagg=self._is_disagg,
         )
 
         if not self._skip_est:
@@ -858,6 +861,7 @@ def _create_kv_cache_manager(
         max_num_tokens: int,
         max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
+        is_disagg: bool,
         estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         # Optional overrides for one-model draft case (when model_engine is None)
@@ -1010,6 +1014,7 @@ def _create_kv_cache_manager(
             config.torch_dtype,
             quant_config.mamba_ssm_cache_dtype
             if quant_config is not None else None,
+            is_disagg,
             # kv cache parameters
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -1063,6 +1068,7 @@ def _create_kv_cache_manager(
             config.torch_dtype,
             quant_config.mamba_ssm_cache_dtype
             if quant_config is not None else None,
+            is_disagg,
             # kv cache parameters
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -1150,7 +1156,8 @@ def create_py_executor_instance(
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
-
+    is_disagg = (cache_transceiver_config is not None
+                 and cache_transceiver_config.backend is not None)
     for key, value in llm_args.extra_resource_managers.items():
         if key in resources:
             raise ValueError(
@@ -1174,7 +1181,7 @@ def create_py_executor_instance(
                 )
 
         model_binding_config = model_engine.model.model_config.get_bindings_model_config(
-        )
+            is_disagg=is_disagg)
 
         num_experts = _try_infer_num_experts(model_engine.model.model_config)
 

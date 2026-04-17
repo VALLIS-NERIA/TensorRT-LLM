@@ -766,6 +766,7 @@ def create_py_executor(
             execution_stream=execution_stream,
             draft_config=draft_config,
             skip_est=skip_est,
+            is_disagg=is_disagg,
         )
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()

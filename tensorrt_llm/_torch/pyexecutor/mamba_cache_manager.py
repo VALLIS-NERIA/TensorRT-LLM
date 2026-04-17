@@ -1198,6 +1198,7 @@ class MambaHybridCacheManager(metaclass=_MambaHybridCacheManagerMeta):
         mamba_layer_mask: List[bool],
         mamba_cache_dtype: torch.dtype,
         mamba_ssm_cache_dtype: torch.dtype,
+        is_disagg: bool,
         # kv cache parameters
         kv_cache_config: KvCacheConfig,
         kv_cache_type: CacheTypeCpp,
@@ -1218,7 +1219,8 @@ class MambaHybridCacheManager(metaclass=_MambaHybridCacheManagerMeta):
         )
 
         spec_config = kwargs.get('spec_config', None)
-        use_v1 = (use_cpp_mamba_cache_manager() or spec_config is not None)
+        use_v1 = (is_disagg or use_cpp_mamba_cache_manager()
+                  or spec_config is not None)
 
         if use_v1:
             logger.info(

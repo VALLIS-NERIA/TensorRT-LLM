@@ -643,6 +643,7 @@ class ModelConfig(Generic[TConfig]):
 
     def get_bindings_model_config(
         self,
+        is_disagg: bool = False,
         tokens_per_block: Optional[int] = None,
         kv_cache_config: Optional[KvCacheConfig] = None,
         spec_config: Optional['SpeculativeConfig'] = None,
@@ -676,7 +677,7 @@ class ModelConfig(Generic[TConfig]):
         hidden_size = ceil_div(self.pretrained_config.hidden_size, attn_tp_size)
         num_layers = self.pretrained_config.num_hidden_layers
         num_attention_layers = self.get_num_attention_layers(
-            kv_cache_config, spec_config)
+            is_disagg, kv_cache_config, spec_config)
         if (self.spec_config is not None
                 and self.spec_config.spec_dec_mode.is_mtp_one_model()):
             num_layers += self.spec_config.num_nextn_predict_layers
@@ -808,6 +809,7 @@ class ModelConfig(Generic[TConfig]):
 
     def get_num_attention_layers(
             self,
+            is_disagg: bool,
             kv_cache_config: Optional[KvCacheConfig] = None,
             spec_config: Optional['SpeculativeConfig'] = None):
         """Return the number of layers that need KV cache blocks.
@@ -820,10 +822,12 @@ class ModelConfig(Generic[TConfig]):
         decoding), both attention and mamba layers are managed in the unified
         KV cache pool, so we return num_hidden_layers (all layers).
         """
-        use_disagg = os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
+        use_disagg = is_disagg or os.environ.get('TRTLLM_USE_CPP_MAMBA',
+                                                 '0') == '1'
         use_reuse = kv_cache_config is not None and kv_cache_config.enable_block_reuse
+        use_spec = spec_config is not None
 
-        use_v1_mamba_manager = use_disagg
+        use_v1_mamba_manager = use_disagg or use_spec
         if is_hybrid_linear(
                 self.pretrained_config) and use_v1_mamba_manager and use_reuse:
             logger.warning(

@@ -880,7 +880,11 @@ class KVCacheManager(BaseResourceManager):
             return max(num_layers, 1)
         # provide at least 1 layer to prevent division by zero cache size
         return max(
-            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+            # when is_disagg=True, for hybrid models it returns the number of full attention layers.
+            len(
+                mapping.pp_layers(
+                    model_config.get_num_attention_layers(is_disagg=True))),
+            1)
 
     # TODO: refactor get_cache_size_per_token and get_cache_bytes_per_token to use the same logic
     @staticmethod
