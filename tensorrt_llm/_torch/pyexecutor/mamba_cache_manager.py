@@ -110,9 +110,8 @@ class BaseMambaCacheManager(ABC):
 class CppMambaCacheManager(BaseResourceManager):
     """Mamba state manager backed by the C++ RnnStateManager bindings.
 
-    Manages only mamba states (conv + SSM). Used when TRTLLM_USE_CPP_MAMBA=1,
-    which is required for disaggregated serving deployments.
-    Does not support speculative decoding.
+    Manages only mamba states (conv + SSM). Used when TRTLLM_USE_CPP_MAMBA=1.
+    Supports disaggregated serving.
     """
 
     def __init__(
@@ -222,7 +221,7 @@ class PythonMambaCacheManager(BaseResourceManager):
     """Pure-Python mamba state manager with speculative decoding support.
 
     Manages only mamba states (conv + SSM) using PyTorch tensors on GPU.
-    Supports caching intermediate states for speculative decoding verification.
+    Supports speculative decoding and disaggregated serving.
     """
 
     @dataclass(frozen=True, kw_only=True)
@@ -561,9 +560,7 @@ class PythonMambaCacheManager(BaseResourceManager):
 class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
     """Facade for standalone mamba state management (no KV cache).
 
-    Delegates to CppMambaCacheManager (when TRTLLM_USE_CPP_MAMBA=1, required
-    for disaggregated serving) or PythonMambaCacheManager (default, supports
-    speculative decoding).
+    Delegates to CppMambaCacheManager (when TRTLLM_USE_CPP_MAMBA=1) or PythonMambaCacheManager.
     """
 
     def __init__(
@@ -695,8 +692,8 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
 class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager):
     """Hybrid cache manager combining separate KVCacheManager and MambaCacheManager.
 
-    Manages KV cache and mamba states in independent pools. Used for
-    speculative decoding or disaggregated serving (via CppMambaCacheManager).
+    Manages KV cache and mamba states in independent pools, with support of
+    speculative decoding and disaggregated serving.
     Does not support block reuse / prefix caching for mamba states.
     """
 
