@@ -401,9 +401,8 @@ class Mamba2Mixer(nn.Module):
             is_target_verify = attn_metadata.kv_cache_manager.is_speculative(
             ) and spec_metadata is not None
             if is_target_verify:
-                # Speculative decoding only supported with Python path
                 assert layer_cache is not None, \
-                    "Speculative decoding requires Python MambaCacheManager"
+                    "Speculative decoding requires mamba_layer_cache() support"
                 # TODO: support dynamic speculation, will add current_draft_len later [TRTLLM-10319]
                 draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window

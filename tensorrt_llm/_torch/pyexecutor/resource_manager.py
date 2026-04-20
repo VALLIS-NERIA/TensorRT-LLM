@@ -418,6 +418,7 @@ class KVCacheManager(BaseResourceManager):
             # max_tokens under _util.py::try_prepare_estimation
             # Since this is a dry run, assigning the same max_tokens capacity
             # to all window sizes as they are full attentions is enough.
+
             self.blocks_in_primary_pool = int(kv_cache_config.max_tokens //
                                               tokens_per_block)
 
@@ -433,13 +434,48 @@ class KVCacheManager(BaseResourceManager):
                 for window_size in set(self.max_attention_window_vec)
             }
             if self.is_linear_attention:
+                if len(self.max_attention_window_vec) != self.num_layers:
+                    logger.info(
+                        f"Original max_attention_window_vec: {self.max_attention_window_vec}"
+                    )
+                    # self.max_attention_window_vec is a pattern, repeat it to match num_layers
+                    self.max_attention_window_vec = (
+                        self.max_attention_window_vec *
+                        (self.num_layers // len(self.max_attention_window_vec) +
+                         1))[:self.num_layers]
+                    logger.info(
+                        f"Adjusted max_attention_window_vec for linear attention: {self.max_attention_window_vec}"
+                    )
+                # _util.py::try_prepare_estimation can't estimate linear attentions properly
+                num_linear_layers = sum(
+                    1 if self.max_attention_window_vec[layer] ==
+                    LinearCacheType.RECURRENT_STATES.value else 0
+                    for layer in self.pp_layers)
+                bytes_per_linear_block = linear_attention_metadata.all_recurrent_states_bytes * num_linear_layers
+                num_attention_layers = self.num_local_layers - num_linear_layers
+                # get_cache_bytes_per_token() calculates assuming all layers are full attention layers
+                total_bytes_per_token = self.get_cache_bytes_per_token(
+                ) * num_attention_layers // self.num_local_layers
+                total_bytes_per_token += bytes_per_linear_block * self.max_batch_size // kv_cache_config.max_tokens
+                max_snapshots = self.max_batch_size
+                if kv_cache_config.enable_block_reuse:
+                    total_bytes_per_token += bytes_per_linear_block // linear_attention_metadata.states_snapshot_interval
+
+                expand_factor = total_bytes_per_token / self.get_cache_bytes_per_token(
+                )
+
+                kv_cache_config.max_tokens = int(kv_cache_config.max_tokens //
+                                                 expand_factor)
+                self.blocks_in_primary_pool = int(kv_cache_config.max_tokens //
+                                                  tokens_per_block)
+                blocks_per_window[self.max_seq_len] = (
+                    self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
                 if kv_cache_config.enable_block_reuse:
                     max_snapshots = max(
                         kv_cache_config.max_tokens //
                         linear_attention_metadata.states_snapshot_interval,
                         self.max_batch_size)
-                else:
-                    max_snapshots = self.max_batch_size
+
                 blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
                     int(max_snapshots), 0)
             logger.info(
@@ -533,6 +569,7 @@ class KVCacheManager(BaseResourceManager):
         self._stream = execution_stream if execution_stream is not None else torch.cuda.Stream(
         )
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
+        logger.info(f"[KVCacheManager] blocks_per_window: {blocks_per_window}")
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -709,8 +746,29 @@ class KVCacheManager(BaseResourceManager):
                         self.kv_connector_manager.update_state_after_alloc(
                             req, block_ids)
 
-            # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
-            scheduled_batch.reset_context_requests()
+            # A request may change from `context_requests_chunking` to
+            # `context_requests_last_chunk` in `add_sequence` due to KV cache
+            # reuse, so we rebuild the context request lists here.
+            #
+            # Skip for the draft KV cache manager: prepare_resources runs
+            # inside request_context(is_draft=True), which sets
+            # use_draft_model=True on every request.  LlmRequest stores
+            # separate chunk-size fields for target and draft
+            # (mContextChunkSizeTarget / mContextChunkSizeDraft).  The
+            # scheduler only sets the *target* chunk size, so the draft
+            # field keeps its default value (= promptLen).  When
+            # reset_context_requests reads is_last_context_chunk under
+            # use_draft_model=True it sees the unmodified draft chunk size,
+            # which covers the full prompt and therefore evaluates to True,
+            # incorrectly promoting the request to context_requests_last_chunk.
+            # That reclassification persists after the context manager
+            # restores use_draft_model=False, breaking downstream sampling
+            # and MTP verification.
+            #
+            # An alternative would be to keep mContextChunkSizeDraft in
+            # sync with mContextChunkSizeTarget, but that causes other problems
+            if not self.is_draft:
+                scheduled_batch.reset_context_requests()
 
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():

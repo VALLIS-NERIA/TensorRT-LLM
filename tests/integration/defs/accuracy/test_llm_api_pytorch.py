@@ -6461,6 +6461,10 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             pytest.skip(
                 f"Device count {get_device_count()} is less than required {gpu_needed}"
             )
+        mtp_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+        )
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
@@ -6478,6 +6482,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(backend="TRTLLM"),
+                speculative_config=mtp_config,
         ) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
@@ -6537,7 +6542,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         with LLM(
                 model_path,
                 kv_cache_config=KvCacheConfig(
-                    enable_block_reuse=False,
+                    enable_block_reuse=True,
                     mamba_ssm_cache_dtype="float16",
                     free_gpu_memory_fraction=0.5,
                 ),
