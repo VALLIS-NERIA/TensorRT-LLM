@@ -1213,8 +1213,12 @@ class MambaHybridCacheManager(metaclass=_MambaHybridCacheManagerMeta):
         )
 
         spec_config = kwargs.get('spec_config', None)
-        use_v1 = (is_disagg or use_cpp_mamba_cache_manager()
-                  or spec_config is not None)
+        use_v1 = (spec_config is not None)
+        if mamba_num_layers == 0:
+            logger.info(
+                "mamba_num_layers is 0, using KVCacheManager without mamba caching"
+            )
+            return KVCacheManager(kv_cache_config, kv_cache_type, **kwargs)
 
         if use_v1:
             logger.info(
