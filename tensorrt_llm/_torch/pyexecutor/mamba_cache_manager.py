@@ -948,15 +948,18 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
             is_estimating_kv_cache=is_estimating_kv_cache,
             linear_attention_metadata=self.linear_attention_metadata,
         )
-        self.mamba_pp_layers, _ = get_pp_layers(
-            mamba_num_layers,
-            mapping,
-            layer_mask=mamba_layer_mask,
-        )
+        # respect base class's pp sharding
+        self.mamba_pp_layers = []
+        for layer_idx in self.pp_layers:
+            if mamba_layer_mask[layer_idx]:
+                self.mamba_pp_layers.append(layer_idx)
+        self.local_num_mamba_layers = len(self.mamba_pp_layers)
+
+        assert self.local_num_mamba_layers > 0, "At least one mamba layer is required"
         self.mamba_layer_offsets = {}
         for idx, layer_id in enumerate(self.mamba_pp_layers):
             self.mamba_layer_offsets[layer_id] = idx
-        self.num_mamba_layers = mamba_num_layers
+
         self.host_block_offsets = torch.zeros([
             self.impl.num_pools, self.max_batch_size, 2, self.max_blocks_per_seq
         ],
@@ -1081,7 +1084,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                                          device="cpu")
         for i in range(len(self.requests)):
             # With layer-first pool layout, setOffsets produces the block index directly
-            # (no longer multiplied by num_mamba_layers)
+            # (no longer multiplied by num_local_mamba_layers)
             value = self.host_block_offsets[self.recurrent_states_pool_index, i,
                                             0, block_indices[i]]
             max_blocks = self.blocks_per_window[
@@ -1134,19 +1137,19 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         return prompt_len - current
 
     def _setup_states_views(self) -> None:
-        # Pool layout: {numLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
+        # Pool layout: {numLocalLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
         pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
-            torch.uint8).reshape(self.num_mamba_layers, -1,
+            torch.uint8).reshape(self.local_num_mamba_layers, -1,
                                  self.ssm_bytes + self.conv_bytes)
         num_blocks_in_pool = pool.shape[1]
         self.all_ssm_states = pool[:, :, :self.ssm_bytes].view(
             self.ssm_state_dtype).view(
-                [self.num_mamba_layers, num_blocks_in_pool] +
+                [self.local_num_mamba_layers, num_blocks_in_pool] +
                 self.ssm_state_shape)
         self.all_conv_states = pool[:, :, self.ssm_bytes:self.ssm_bytes +
                                     self.conv_bytes].view(
                                         self.conv_state_dtype).view([
-                                            self.num_mamba_layers,
+                                            self.local_num_mamba_layers,
                                             num_blocks_in_pool
                                         ] + self.conv_state_shape)
 

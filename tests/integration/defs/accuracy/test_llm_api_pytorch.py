@@ -6423,7 +6423,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.parametrize(
         "tp_size, ep_size, mamba_state_cache_interval, attention_dp",
         [
@@ -6436,6 +6435,11 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      mamba_state_cache_interval, attention_dp):
+        gpu_needed = max(tp_size, ep_size)
+        if get_device_count() < gpu_needed:
+            pytest.skip(
+                f"Device count {get_device_count()} is less than required {gpu_needed}"
+            )
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(

@@ -370,6 +370,24 @@ class KVCacheManager(BaseResourceManager):
         if kv_cache_config.max_attention_window is None:
             # Use max_seq_len as default max_attention_window
             self.max_attention_window_vec = [max_seq_len]
+        elif len(kv_cache_config.max_attention_window) == num_layers:
+            # we need to shard the max_attention_window according to the layer_mask and pp_layers
+            self.max_attention_window_vec = []
+            if layer_mask is not None:
+                global_enabled_layers = [
+                    layer_idx for layer_idx in range(len(layer_mask))
+                    if layer_mask[layer_idx]
+                ]
+            else:
+                global_enabled_layers = list(range(num_layers))
+            pp_rank_offset = global_enabled_layers.index(self.pp_layers[0])
+            for layer_idx in self.pp_layers:
+                if layer_mask is not None and not layer_mask[layer_idx]:
+                    continue
+                window_size = kv_cache_config.max_attention_window[
+                    pp_rank_offset + self.layer_offsets[layer_idx]]
+                window_size = min(window_size, max_seq_len)
+                self.max_attention_window_vec.append(window_size)
         else:
             self.max_attention_window_vec = kv_cache_config.max_attention_window.copy(
             )  # Make a copy to avoid modifying original
