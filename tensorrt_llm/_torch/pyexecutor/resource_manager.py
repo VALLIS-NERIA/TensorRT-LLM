@@ -454,10 +454,13 @@ class KVCacheManager(BaseResourceManager):
                 bytes_per_linear_block = linear_attention_metadata.all_recurrent_states_bytes * num_linear_layers
                 num_attention_layers = self.num_local_layers - num_linear_layers
                 # get_cache_bytes_per_token() calculates assuming all layers are full attention layers
-                total_bytes_per_token = self.get_cache_bytes_per_token(
-                ) * num_attention_layers // self.num_local_layers
+                total_bytes_per_token = self.get_cache_bytes_per_token()
+                # scale it to match the actual number of full attention layers
+                total_bytes_per_token *= num_attention_layers // self.num_local_layers
+                # count the must-have states for each request
                 total_bytes_per_token += bytes_per_linear_block * self.max_batch_size // kv_cache_config.max_tokens
                 max_snapshots = self.max_batch_size
+                # count the regularly snapshots for reuse
                 if kv_cache_config.enable_block_reuse:
                     total_bytes_per_token += bytes_per_linear_block // linear_attention_metadata.states_snapshot_interval
 

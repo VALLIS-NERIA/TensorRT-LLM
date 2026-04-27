@@ -829,8 +829,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
     C++ KVCacheManager, enabling block reuse / prefix caching across attention
     and mamba layers. This is the default hybrid manager.
 
-    Speculative decoding is supported via separate intermediate state tensors
-    allocated outside the unified pool. Disaggregated serving is not supported.
+    Disaggregated serving is not supported yet.
     """
 
     def __init__(
@@ -863,12 +862,6 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         is_estimating_kv_cache: bool = False,
         **kwargs,
     ) -> None:
-        self.mamba_pp_layers, _ = get_pp_layers(
-            mamba_num_layers,
-            mapping,
-            layer_mask=mamba_layer_mask,
-        )
-
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
         tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
         d_inner = mamba_head_dim * mamba_num_heads
@@ -960,60 +953,24 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         self.requests = []
         self.recurrent_states_pool_index = self.kv_cache_pool_mapping[
             self.layer_offsets[self.mamba_pp_layers[0]]][0]
-        self._setup_states_views()
+
         self.cuda_state_indices = torch.zeros([self.max_batch_size],
                                               dtype=torch.int32,
                                               device="cuda")
         self.kv_cache_config = kv_cache_config
-
         self.is_estimating_kv_cache = is_estimating_kv_cache
+        self.spec_config = spec_config
 
-        # Speculative decoding support: allocate intermediate state tensors
-        # outside the unified pool for caching per-draft-token snapshots.
-        self._spec_config = spec_config
-        if spec_config is not None:
-            speculative_num_draft_tokens = spec_config.max_draft_len
-            num_local_mamba_layers = len(self.mamba_pp_layers)
-            ssm_state_shape_tuple = tuple(self.ssm_state_shape)
-            conv_state_shape_tuple = tuple(self.conv_state_shape)
-
-            self._intermediate_ssm_states = torch.zeros(
-                size=(num_local_mamba_layers, max_batch_size,
-                      speculative_num_draft_tokens + 1) + ssm_state_shape_tuple,
-                dtype=self.ssm_state_dtype,
-                device="cuda",
-            )
-
-            self._intermediate_conv_states = torch.zeros(
-                size=(num_local_mamba_layers, max_batch_size,
-                      speculative_num_draft_tokens + 1) +
-                conv_state_shape_tuple,
-                dtype=self.conv_state_dtype,
-                device="cuda",
-            )
-
-            self._intermediate_state_indices = torch.arange(max_batch_size,
-                                                            dtype=torch.int32,
-                                                            device="cuda")
-
-            logger.debug(
-                f"CppMambaHybridCacheManager speculative buffers allocated. "
-                f"intermediate_ssm size: {get_tensor_size_bytes(self._intermediate_ssm_states) / GB:.2f}GB, "
-                f"intermediate_conv size: {get_tensor_size_bytes(self._intermediate_conv_states) / GB:.2f}GB"
-            )
-        else:
-            self._intermediate_ssm_states = None
-            self._intermediate_conv_states = None
-            self._intermediate_state_indices = None
+        self._setup_states()
 
     def shutdown(self):
         # Release tensor views into the pool before the pool memory is freed,
         # so their deleters don't see stale pointers.
         self.all_ssm_states = None
         self.all_conv_states = None
-        self._intermediate_ssm_states = None
-        self._intermediate_conv_states = None
-        self._intermediate_state_indices = None
+        self.intermediate_ssm_states = None
+        self.intermediate_conv_states = None
+        self.intermediate_state_indices = None
         super().shutdown()
 
     def add_dummy_requests(
@@ -1069,7 +1026,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         self._prepare_resources(scheduled_batch)
 
     def is_speculative(self) -> bool:
-        return self._spec_config is not None
+        return self.spec_config is not None
 
     def update_mamba_states(self, attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor):
@@ -1085,16 +1042,16 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         state_indices_d = self.get_state_indices()[num_contexts:num_contexts +
                                                    num_gens]
 
-        src_state_indices = self._intermediate_state_indices[:num_gens]
+        src_state_indices = self.intermediate_state_indices[:num_gens]
 
         # Copy accepted SSM states from intermediate buffer back to pool
-        accepted_ssm = self._intermediate_ssm_states[:, src_state_indices,
-                                                     num_accepted_draft_tokens]
+        accepted_ssm = self.intermediate_ssm_states[:, src_state_indices,
+                                                    num_accepted_draft_tokens]
         self.all_ssm_states[:, state_indices_d, :] = accepted_ssm
 
         # Copy accepted conv states from intermediate buffer back to pool
-        accepted_conv = self._intermediate_conv_states[:, src_state_indices,
-                                                       num_accepted_draft_tokens]
+        accepted_conv = self.intermediate_conv_states[:, src_state_indices,
+                                                      num_accepted_draft_tokens]
         self.all_conv_states[:, state_indices_d, :] = accepted_conv
 
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
@@ -1105,17 +1062,17 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
 
     def get_intermediate_ssm_states(self,
                                     layer_idx: int) -> Optional[torch.Tensor]:
-        if self._intermediate_ssm_states is None:
+        if self.intermediate_ssm_states is None:
             return None
         layer_offset = self.mamba_layer_offsets[layer_idx]
-        return self._intermediate_ssm_states[layer_offset]
+        return self.intermediate_ssm_states[layer_offset]
 
     def get_intermediate_conv_states(self,
                                      layer_idx: int) -> Optional[torch.Tensor]:
-        if self._intermediate_conv_states is None:
+        if self.intermediate_conv_states is None:
             return None
         layer_offset = self.mamba_layer_offsets[layer_idx]
-        return self._intermediate_conv_states[layer_offset]
+        return self.intermediate_conv_states[layer_offset]
 
     def mamba_layer_cache(
         self, layer_idx: int
@@ -1123,14 +1080,14 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                PythonMambaCacheManager.SpeculativeState, None]:
         conv = self.get_conv_states(layer_idx)
         ssm = self.get_ssm_states(layer_idx)
-        if self._spec_config is not None:
+        if self.spec_config is not None:
             layer_offset = self.mamba_layer_offsets[layer_idx]
             return PythonMambaCacheManager.SpeculativeState(
                 conv=conv,
                 temporal=ssm,
-                intermediate_ssm=self._intermediate_ssm_states[layer_offset],
+                intermediate_ssm=self.intermediate_ssm_states[layer_offset],
                 intermediate_conv_window=self.
-                _intermediate_conv_states[layer_offset],
+                intermediate_conv_states[layer_offset],
             )
         return PythonMambaCacheManager.State(conv=conv, temporal=ssm)
 
@@ -1210,7 +1167,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                 return pos - current
         return prompt_len - current
 
-    def _setup_states_views(self) -> None:
+    def _setup_states(self) -> None:
         # Pool layout: {numLocalLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
         pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
             torch.uint8).reshape(self.local_num_mamba_layers, -1,
@@ -1226,6 +1183,33 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                                             self.local_num_mamba_layers,
                                             num_blocks_in_pool
                                         ] + self.conv_state_shape)
+        self.intermediate_ssm_states = None
+        self.intermediate_conv_states = None
+        self.intermediate_state_indices = None
+        if self.spec_config is not None:
+            speculative_num_draft_tokens = self.spec_config.max_draft_len
+            num_local_mamba_layers = len(self.mamba_pp_layers)
+            ssm_state_shape_tuple = tuple(self.ssm_state_shape)
+            conv_state_shape_tuple = tuple(self.conv_state_shape)
+
+            self.intermediate_ssm_states = torch.zeros(
+                size=(num_local_mamba_layers, self.max_batch_size,
+                      speculative_num_draft_tokens + 1) + ssm_state_shape_tuple,
+                dtype=self.ssm_state_dtype,
+                device="cuda",
+            )
+
+            self.intermediate_conv_states = torch.zeros(
+                size=(num_local_mamba_layers, self.max_batch_size,
+                      speculative_num_draft_tokens + 1) +
+                conv_state_shape_tuple,
+                dtype=self.conv_state_dtype,
+                device="cuda",
+            )
+
+            self.intermediate_state_indices = torch.arange(self.max_batch_size,
+                                                           dtype=torch.int32,
+                                                           device="cuda")
 
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self.ssm_state_dtype
@@ -1259,8 +1243,9 @@ class MambaHybridCacheManager(metaclass=_MambaHybridCacheManagerMeta):
     """Factory that selects the appropriate hybrid cache manager.
 
     Selection logic:
-    - TRTLLM_USE_CPP_MAMBA=1 (disaggregated serving) -> MixedMambaHybridCacheManager
-    - Otherwise (default, including speculative decoding) -> CppMambaHybridCacheManager
+    - mamba_num_layers=0 -> KVCacheManager without mamba caching
+    - TRTLLM_USE_CPP_MAMBA=1 or is_disagg=True -> MixedMambaHybridCacheManager
+    - Otherwise -> CppMambaHybridCacheManager
     """
 
     def __new__(
