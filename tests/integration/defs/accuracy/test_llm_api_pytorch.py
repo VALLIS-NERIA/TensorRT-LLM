@@ -6445,17 +6445,19 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size, ep_size, mamba_state_cache_interval, attention_dp",
+        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp",
         [
-            (1, 1, 256, False),
-            (4, 1, 256, False),
-            (4, 4, 512, False),
-            (4, 4, 256, True),
+            (1, 1, 256, False, False),
+            (4, 1, 256, False, True),
+            (4, 4, 256, False, False),
+            (4, 4, 256, True, False),
+            (4, 4, 512, True, True),
         ],
-        ids=["TP1", "TP4", "TEP4", "TEP4_ADP"],
+        ids=["TP1", "TP4_MTP", "TEP4", "TEP4_ADP", "TEP4_ADP_MTP"],
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
-                                     mamba_state_cache_interval, attention_dp):
+                                     mamba_state_cache_interval, attention_dp,
+                                     use_mtp):
         gpu_needed = max(tp_size, ep_size)
         if get_device_count() < gpu_needed:
             pytest.skip(
@@ -6482,7 +6484,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(backend="TRTLLM"),
-                speculative_config=mtp_config,
+                speculative_config=mtp_config if use_mtp else None,
         ) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
