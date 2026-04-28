@@ -21,8 +21,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper, copy_batch_block_offsets_to_device)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
-from tensorrt_llm.llmapi.llm_args import (KvCacheConfig, PeftCacheConfig,
-                                          PybindMirror)
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
@@ -446,33 +445,14 @@ class KVCacheManager(BaseResourceManager):
                     logger.info(
                         f"Adjusted max_attention_window_vec for linear attention: {self.max_attention_window_vec}"
                     )
-                # _util.py::try_prepare_estimation can't estimate linear attentions properly
-                num_linear_layers = sum(
-                    1 if self.max_attention_window_vec[layer] ==
-                    LinearCacheType.RECURRENT_STATES.value else 0
-                    for layer in self.pp_layers)
-                bytes_per_linear_block = linear_attention_metadata.all_recurrent_states_bytes * num_linear_layers
-                num_attention_layers = self.num_local_layers - num_linear_layers
-                # get_cache_bytes_per_token() calculates assuming all layers are full attention layers
-                total_bytes_per_token = self.get_cache_bytes_per_token()
-                # scale it to match the actual number of full attention layers
-                total_bytes_per_token *= num_attention_layers // self.num_local_layers
-                # count the must-have states for each request
-                total_bytes_per_token += bytes_per_linear_block * self.max_batch_size // kv_cache_config.max_tokens
+                # max_tokens is already the affine-correct value computed
+                # upstream (_util.py:_tokens_for_budget honors the slope +
+                # intercept of CppMambaHybridCacheManager). Recurrent state
+                # slots live in a separate window: at minimum the live
+                # state per concurrent request, and -- when block reuse is
+                # enabled -- enough room for one regular snapshot per
+                # snapshot interval over the full token budget.
                 max_snapshots = self.max_batch_size
-                # count the regularly snapshots for reuse
-                if kv_cache_config.enable_block_reuse:
-                    total_bytes_per_token += bytes_per_linear_block // linear_attention_metadata.states_snapshot_interval
-
-                expand_factor = total_bytes_per_token / self.get_cache_bytes_per_token(
-                )
-
-                kv_cache_config.max_tokens = int(kv_cache_config.max_tokens //
-                                                 expand_factor)
-                self.blocks_in_primary_pool = int(kv_cache_config.max_tokens //
-                                                  tokens_per_block)
-                blocks_per_window[self.max_seq_len] = (
-                    self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
                 if kv_cache_config.enable_block_reuse:
                     max_snapshots = max(
                         kv_cache_config.max_tokens //
@@ -1002,13 +982,8 @@ class KVCacheManager(BaseResourceManager):
         """
         if num_layers is not None:
             return max(num_layers, 1)
-        # provide at least 1 layer to prevent division by zero cache size
         return max(
-            # when is_disagg=True, for hybrid models it returns the number of full attention layers.
-            len(
-                mapping.pp_layers(
-                    model_config.get_num_attention_layers(is_disagg=True))),
-            1)
+            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
 
     # TODO: refactor get_cache_size_per_token and get_cache_bytes_per_token to use the same logic
     @staticmethod
@@ -1019,6 +994,7 @@ class KVCacheManager(BaseResourceManager):
 
         # get num key value heads
         config = model_config.pretrained_config
+        # assert not is_hybrid_linear(config)
         num_key_value_heads = getattr(config, 'num_key_value_heads',
                                       config.num_attention_heads)
         if isinstance(num_key_value_heads, Iterable):
@@ -1498,6 +1474,85 @@ class KVCacheManager(BaseResourceManager):
         return (adjusted_window_size_to_layers,
                 adjusted_max_attention_window_vec)
 
+    def _calculate_max_num_blocks_for_linear_attention(
+            self,
+            kv_cache_config: KvCacheConfig,
+            extra_cost_memory: int = 0) -> dict[int, tuple[int, int]]:
+        """Python sizing for the unified hybrid mamba pool.
+
+        Replaces the old ``KVCacheManagerCpp.calculate_max_num_blocks`` C++
+        binding call. Uses the affine memory model::
+
+            bytes(T) = slope * T + intercept
+            slope     = attention_bytes_per_token + state_bytes / interval
+            intercept = max_batch_size * #mamba_layers_local * state_bytes
+
+        Recurrent state slots live in their own logical "window" keyed by
+        ``LinearCacheType.RECURRENT_STATES``; attention KV blocks share the
+        rest of the dict.
+        """
+        primary_budget = self._primary_pool_memory_bytes - extra_cost_memory
+
+        state_bytes_per_layer = (
+            self.linear_attention_metadata.all_recurrent_states_bytes)
+        # Per-rank mamba layer count. self.pp_layers is 0-based local indices
+        # into this rank's layer slice; max_attention_window_vec is keyed by
+        # the same indexing.
+        num_mamba_layers_local = sum(1 for layer in self.pp_layers
+                                     if self.max_attention_window_vec[layer] ==
+                                     LinearCacheType.RECURRENT_STATES.value)
+        state_bytes_local = num_mamba_layers_local * state_bytes_per_layer
+
+        attention_slope = self.get_cache_bytes_per_token()
+        interval = self.linear_attention_metadata.states_snapshot_interval
+        if interval is None or interval <= 0:
+            mamba_slope = 0
+        else:
+            mamba_slope = state_bytes_local // interval
+        slope = attention_slope + mamba_slope
+        # STATIC_SLOTS_PER_REQUEST = 1 (live state); fixed-position
+        # snapshots are not yet implemented.
+        intercept = self.max_batch_size * state_bytes_local
+
+        if slope > 0:
+            max_tokens = max((primary_budget - intercept) // slope, 0)
+        else:
+            max_tokens = 0
+        if kv_cache_config.max_tokens is not None:
+            max_tokens = min(kv_cache_config.max_tokens, max_tokens)
+
+        blocks_in_primary_pool = int(max_tokens // self.tokens_per_block)
+
+        # Secondary host pool only mirrors attention KV blocks; mamba state
+        # never spills to host, so divide by attention slope only.
+        if attention_slope > 0:
+            max_tokens_secondary = (self._secondary_pool_memory_bytes //
+                                    attention_slope)
+        else:
+            max_tokens_secondary = 0
+        blocks_in_secondary_pool = int(max_tokens_secondary //
+                                       self.tokens_per_block)
+
+        # Recurrent state slot count: live state per concurrent request, with
+        # extra room for one regular snapshot per snapshot interval over the
+        # full token budget when block reuse is enabled.
+        max_snapshots = self.max_batch_size
+        if (kv_cache_config.enable_block_reuse and interval is not None
+                and interval > 0):
+            max_snapshots = max(max_tokens // interval, self.max_batch_size)
+
+        # Build per-window dict: each unique attention window gets the same
+        # (primary, secondary) attention block count; the recurrent-states
+        # sentinel gets the snapshot pool.
+        blocks_per_window = {
+            window_size: (blocks_in_primary_pool, blocks_in_secondary_pool)
+            for window_size in set(self.max_attention_window_vec)
+            if window_size != LinearCacheType.RECURRENT_STATES.value
+        }
+        blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
+            int(max_snapshots), 0)
+        return blocks_per_window
+
     def calculate_max_num_blocks_for_vswa(
             self,
             kv_cache_config: KvCacheConfig,
@@ -1526,15 +1581,6 @@ class KVCacheManager(BaseResourceManager):
 
         # VSWA on Torch backend has not supported the cross attention.
         is_cross_attention = False
-        # check model config
-
-        # Construct WorldConfig from self.mapping
-        world_config_cpp = WorldConfig(
-            tensor_parallelism=self.mapping.tp_size,
-            pipeline_parallelism=self.mapping.pp_size,
-            rank=self.mapping.rank,
-            gpus_per_node=self.mapping.gpus_per_node,
-            enable_attention_dp=self.mapping.enable_attention_dp)
 
         window_size_to_layers = self._get_window_size_to_layers()
         logger.debug(f"window_size_to_layers: {window_size_to_layers}")
@@ -1551,23 +1597,10 @@ class KVCacheManager(BaseResourceManager):
         )
 
         if self.is_linear_attention:
-            blocks_per_window = KVCacheManagerCpp.calculate_max_num_blocks(
-                config=PybindMirror.maybe_to_pybind(kv_cache_config),
-                dtype=self.dtype,
-                num_kv_heads_per_layer=list(self.num_kv_heads_per_layer),
-                size_per_head=self.head_dim,
-                tokens_per_block=self.tokens_per_block,
-                world_config=world_config_cpp,
-                window_size_to_layers=window_size_to_layers,
-                allotted_primary_mem_bytes=self._primary_pool_memory_bytes,
-                allotted_secondary_mem_bytes=self._secondary_pool_memory_bytes,
+            return self._calculate_max_num_blocks_for_linear_attention(
+                kv_cache_config=kv_cache_config,
                 extra_cost_memory=extra_cost_memory,
-                kv_factor=self.kv_factor,
-                max_batch_size=self.max_batch_size,
-                linear_attention_metadata=PybindMirror.maybe_to_pybind(
-                    self.linear_attention_metadata),
             )
-            return blocks_per_window
 
         # VSWA case: use C++ implementation for variable window sizes
         if model_config is None:

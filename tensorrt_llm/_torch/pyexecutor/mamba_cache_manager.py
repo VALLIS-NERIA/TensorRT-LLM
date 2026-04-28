@@ -689,7 +689,17 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
         self._impl.update_mamba_states(attn_metadata, num_accepted_tokens)
 
 
-class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager):
+class MambaHybridCacheManager:
+    """Marker base class for hybrid mamba cache manager implementations.
+
+    Used purely for ``isinstance`` / type-hint purposes so callers can refer
+    to the family without caring about the concrete implementation. Concrete
+    selection (Mixed vs Cpp) lives in ``_util.py:_get_model_kv_cache_manager_cls``.
+    """
+
+
+class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
+                                   MambaHybridCacheManager):
     """Hybrid cache manager combining separate KVCacheManager and MambaCacheManager.
 
     Manages KV cache and mamba states in independent pools, with support of
@@ -822,7 +832,8 @@ def calc_context_stop_positions(prompt_len: int,
     return stop_positions
 
 
-class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
+class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
+                                 MambaHybridCacheManager):
     """Hybrid cache manager storing mamba states inside the KVCacheManager pool.
 
     Both KV cache blocks and recurrent state blocks are managed by the unified
@@ -907,21 +918,43 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         full_attention_layer_mask = layer_mask.copy()
 
         kv_cache_config.max_attention_window = []
+        # 3 kinds of layers:
+        # 1) Mamba layers (mamba_layer_mask is True)
+        # 2) Full attention layers (full_attention_layer_mask is True)
+        # 3) Not managed layers (both masks are False)
+        total_layers = len(mamba_layer_mask)
         layer_mask = [
             mamba_layer_mask[i] or full_attention_layer_mask[i]
-            for i in range(len(mamba_layer_mask))
+            for i in range(total_layers)
         ]
         for i in range(len(layer_mask)):
             if layer_mask[i]:
                 kv_cache_config.max_attention_window.append(
                     LinearCacheType.RECURRENT_STATES.
                     value if mamba_layer_mask[i] else max_seq_len)
+
+        # Normalize num_kv_heads to a per-layer list and zero out mamba
+        # layer positions: those layers carry SSM/conv state instead of KV
+        # heads, so the parent KV cache should not allocate KV head storage
+        # for them.
+        if isinstance(num_kv_heads, int):
+            per_layer_kv_heads = [num_kv_heads] * total_layers
+        else:
+            if len(num_kv_heads) != total_layers:
+                raise ValueError(
+                    f"num_kv_heads list length ({len(num_kv_heads)}) does not "
+                    f"match total layers ({total_layers})")
+            per_layer_kv_heads = list(num_kv_heads)
+        for i, is_mamba in enumerate(mamba_layer_mask):
+            if is_mamba:
+                per_layer_kv_heads[i] = 0
+
         # pass remaining arguments to super class
         super().__init__(
             kv_cache_config,
             kv_cache_type,
             num_layers=mamba_num_layers + num_layers,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=per_layer_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
@@ -962,6 +995,79 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         self.spec_config = spec_config
 
         self._setup_states()
+
+    @staticmethod
+    def get_cache_size_per_token(
+        model_config,
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        kv_cache_config: KvCacheConfig,
+        num_layers: Optional[int] = None,
+        **kwargs,
+    ):
+        """Affine memory model for the unified hybrid KV pool.
+
+        Returns ``(slope_bytes_per_token, intercept_bytes)``:
+
+        * ``slope`` = attention KV bytes per token (parent's formula) plus
+          the amortized regular-snapshot bytes per token from mamba layers.
+        * ``intercept`` = ``max_batch_size * num_mamba_layers_per_rank *
+          state_bytes_per_layer * STATIC_SLOTS_PER_REQUEST``.
+
+        Memory budget -> max tokens then becomes
+        ``T = (budget - intercept) // slope`` instead of plain
+        ``T = budget // bytes_per_token``.
+        """
+        # Lazy import to avoid pulling config_utils into module import order.
+        from tensorrt_llm._torch.pyexecutor.config_utils import \
+            extract_mamba_kv_cache_params
+
+        # Attention slope from the parent's existing formula.
+        attention_slope = KVCacheManager.get_cache_size_per_token(
+            model_config, mapping, num_layers=num_layers, **kwargs)
+
+        params = extract_mamba_kv_cache_params(
+            model_config.pretrained_config,
+            quant_config=model_config.quant_config,
+        )
+
+        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        d_inner = params.head_dim * params.num_heads
+        conv_dim = (d_inner +
+                    2 * params.n_groups * params.state_size) // tp_size
+        nheads = params.num_heads // tp_size
+
+        conv_dtype = params.dtype
+        ssm_dtype = (params.mamba_ssm_cache_dtype if
+                     params.mamba_ssm_cache_dtype is not None else params.dtype)
+        conv_bytes = conv_dim * (params.conv_kernel - 1) * conv_dtype.itemsize
+        ssm_bytes = (nheads * params.head_dim * params.state_size *
+                     ssm_dtype.itemsize)
+        state_bytes_per_layer = conv_bytes + ssm_bytes
+
+        # Per-rank mamba layer count, mirroring how the parent slices PP for
+        # attention (len(mapping.pp_layers(global_attn_count))).
+        num_mamba_layers_per_rank = len(
+            mapping.pp_layers(params.num_mamba_layers))
+        state_bytes_per_rank = num_mamba_layers_per_rank * state_bytes_per_layer
+
+        # Per-request fixed cost. STATIC_SLOTS_PER_REQUEST = 1 today (the
+        # live mamba state); fixed-position snapshots are not yet
+        # implemented and would simply increment this constant.
+        STATIC_SLOTS_PER_REQUEST = 1
+        intercept = (max_batch_size * state_bytes_per_rank *
+                     STATIC_SLOTS_PER_REQUEST)
+
+        # Regular-snapshot bytes per token. None / non-positive intervals
+        # mean "no regular snapshots", so the mamba contribution is zero.
+        interval = kv_cache_config.mamba_state_cache_interval
+        if interval is None or interval <= 0:
+            mamba_slope = 0
+        else:
+            mamba_slope = state_bytes_per_rank // interval
+
+        return attention_slope + mamba_slope, intercept
 
     def shutdown(self):
         # Release tensor views into the pool before the pool memory is freed,
@@ -1213,87 +1319,3 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
 
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self.ssm_state_dtype
-
-
-class _MambaHybridCacheManagerMeta(type):
-    """Metaclass that enables isinstance/issubclass checks against
-    MambaHybridCacheManager for both Mixed and Cpp implementations."""
-
-    def __instancecheck__(cls, instance):
-        if cls is MambaHybridCacheManager:
-            return isinstance(
-                instance,
-                (MixedMambaHybridCacheManager, CppMambaHybridCacheManager))
-        return super().__instancecheck__(instance)
-
-    def __subclasscheck__(cls, subclass):
-        if cls is MambaHybridCacheManager:
-            return issubclass(
-                subclass,
-                (MixedMambaHybridCacheManager, CppMambaHybridCacheManager))
-        return super().__subclasscheck__(subclass)
-
-    def __getattr__(cls, name):
-        """Forward class-level attribute access (e.g. static methods) to
-        KVCacheManager. Add attributes here as needed."""
-        return getattr(KVCacheManager, name)
-
-
-class MambaHybridCacheManager(metaclass=_MambaHybridCacheManagerMeta):
-    """Factory that selects the appropriate hybrid cache manager.
-
-    Selection logic:
-    - mamba_num_layers=0 -> KVCacheManager without mamba caching
-    - TRTLLM_USE_CPP_MAMBA=1 or is_disagg=True -> MixedMambaHybridCacheManager
-    - Otherwise -> CppMambaHybridCacheManager
-    """
-
-    def __new__(
-        cls,
-        # mamba cache parameters
-        mamba_d_state: int,
-        mamba_d_conv: int,
-        mamba_num_heads: int,
-        mamba_n_groups: int,
-        mamba_head_dim: int,
-        mamba_num_layers: int,
-        mamba_layer_mask: List[bool],
-        mamba_cache_dtype: torch.dtype,
-        mamba_ssm_cache_dtype: torch.dtype,
-        is_disagg: bool,
-        # kv cache parameters
-        kv_cache_config: KvCacheConfig,
-        kv_cache_type: CacheTypeCpp,
-        **kwargs,
-    ):
-        positional_args = (
-            mamba_d_state,
-            mamba_d_conv,
-            mamba_num_heads,
-            mamba_n_groups,
-            mamba_head_dim,
-            mamba_num_layers,
-            mamba_layer_mask,
-            mamba_cache_dtype,
-            mamba_ssm_cache_dtype,
-            kv_cache_config,
-            kv_cache_type,
-        )
-
-        if mamba_num_layers == 0:
-            logger.info(
-                "mamba_num_layers is 0, using KVCacheManager without mamba caching"
-            )
-            return KVCacheManager(kv_cache_config, kv_cache_type, **kwargs)
-
-        use_v1 = (is_disagg or use_cpp_mamba_cache_manager())
-
-        if use_v1:
-            logger.info(
-                "Using MixedMambaHybridCacheManager for hybrid cache management"
-            )
-            return MixedMambaHybridCacheManager(*positional_args, **kwargs)
-        else:
-            logger.info(
-                "Using CppMambaHybridCacheManager for hybrid cache management")
-            return CppMambaHybridCacheManager(*positional_args, **kwargs)
