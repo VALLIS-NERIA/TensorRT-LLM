@@ -3761,7 +3761,11 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
             windowSizeToShare[LinearAttentionMetadata::kRecurrentStates]
                 = 0.0f; // all memory goes to the main window size, and we will allocate static memory for linear
                         // attention states
-            auto const staticMemoryBytes = maxBatchSize * linearAttentionMetadata->allRecurrentStatesBytes;
+            // allRecurrentStatesBytes is per-layer.
+            auto const numLinearLayers
+                = static_cast<uint64_t>(windowSizeToLayers.at(LinearAttentionMetadata::kRecurrentStates).size());
+            auto const staticMemoryBytes = static_cast<uint64_t>(maxBatchSize) * numLinearLayers
+                * static_cast<uint64_t>(linearAttentionMetadata->allRecurrentStatesBytes);
             TLLM_CHECK_WITH_INFO(allottedPrimaryMemBytes > staticMemoryBytes,
                 "Not enough memory to allocate static cache for linear attention states. Required: %0.2f GiB, "
                 "Allotted: %0.2f GiB",
