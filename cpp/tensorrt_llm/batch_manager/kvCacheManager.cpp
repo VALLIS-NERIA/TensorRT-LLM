@@ -3639,7 +3639,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     // When the model is mamba hybrid (i.e. has only 2 windows sizes: max_seq_len and
     // LinearAttentionMetadata::kRecurrentStates), and block reuse is disabled, we can allocate static memory for the
     // linear attention states - max_batch_size blocks.
-    bool isStaticHybridModel = windowSizeToLayers.size() == 2
+    bool const isStaticHybridNoReuseModel = windowSizeToLayers.size() == 2
         && windowSizeToLayers.count(LinearAttentionMetadata::LinearCacheType::kRecurrentStates) == 1
         && linearAttentionMetadata.has_value() && !config.getEnableBlockReuse();
     bool const isVSWA = cacheSizeBytesPerTokenPerWindow.size() > 1;
@@ -3653,7 +3653,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
         auto memoryBudget = static_cast<uint64_t>(allottedPrimaryMemBytes * windowSizeShare);
         if (LinearAttentionMetadata::hasRecurrentStatesCache(windowSize))
         {
-            if (isStaticHybridModel)
+            if (isStaticHybridNoReuseModel)
             {
                 TLLM_LOG_DEBUG(
                     "Static hybrid model with linear attention states, allocating maxBatchSize (%d) blocks for window "
@@ -3688,7 +3688,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
         auto memoryBudget = static_cast<uint64_t>(allottedSecondaryMemBytes * windowSizeShare);
         if (LinearAttentionMetadata::hasLinearCache(windowSize))
         {
-            if (isStaticHybridModel && memoryBudget > 0)
+            if (isStaticHybridNoReuseModel && memoryBudget > 0)
             {
                 TLLM_LOG_WARNING("It's meaningless to allocate secondary memory when block reuse is disabled.");
             }
@@ -3752,7 +3752,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
             windowSizeToShare[windowSize] = 1.0f / windowSizeToLayers.size();
         }
 
-        if (isStaticHybridModel)
+        if (isStaticHybridNoReuseModel)
         {
             for (auto const& [windowSize, _] : windowSizeToLayers)
             {
