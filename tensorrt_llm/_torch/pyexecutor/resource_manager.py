@@ -417,7 +417,6 @@ class KVCacheManager(BaseResourceManager):
             # max_tokens under _util.py::try_prepare_estimation
             # Since this is a dry run, assigning the same max_tokens capacity
             # to all window sizes as they are full attentions is enough.
-
             self.blocks_in_primary_pool = int(kv_cache_config.max_tokens //
                                               tokens_per_block)
 
@@ -729,30 +728,6 @@ class KVCacheManager(BaseResourceManager):
                         self.kv_connector_manager.update_state_after_alloc(
                             req, block_ids)
 
-            # A request may change from `context_requests_chunking` to
-            # `context_requests_last_chunk` in `add_sequence` due to KV cache
-            # reuse, so we rebuild the context request lists here.
-            #
-            # Skip for the draft KV cache manager: prepare_resources runs
-            # inside request_context(is_draft=True), which sets
-            # use_draft_model=True on every request.  LlmRequest stores
-            # separate chunk-size fields for target and draft
-            # (mContextChunkSizeTarget / mContextChunkSizeDraft).  The
-            # scheduler only sets the *target* chunk size, so the draft
-            # field keeps its default value (= promptLen).  When
-            # reset_context_requests reads is_last_context_chunk under
-            # use_draft_model=True it sees the unmodified draft chunk size,
-            # which covers the full prompt and therefore evaluates to True,
-            # incorrectly promoting the request to context_requests_last_chunk.
-            # That reclassification persists after the context manager
-            # restores use_draft_model=False, breaking downstream sampling
-            # and MTP verification.
-            #
-            # An alternative would be to keep mContextChunkSizeDraft in
-            # sync with mContextChunkSizeTarget, but that causes other problems
-            if not self.is_draft:
-                scheduled_batch.reset_context_requests()
-
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
                     # Distribute the decode blocks across CP ranks in a round-robin manner.
@@ -772,6 +747,11 @@ class KVCacheManager(BaseResourceManager):
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
             self.impl.refresh_blocks()
+
+        # A request may change from `context_requests_chunking` to
+        # `context_requests_last_chunk` in `add_sequence` due to KV cache
+        # reuse, so we rebuild the context request lists here.
+        scheduled_batch.reset_context_requests()
 
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.build_scheduler_output(
