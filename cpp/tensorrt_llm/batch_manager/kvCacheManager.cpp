@@ -3635,6 +3635,13 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
         auto const cacheSizeBytesPerToken = cacheSizePerToken * BufferDataType(dtype).getSize();
         cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
     }
+
+    // When the model is mamba hybrid (i.e. has only 2 windows sizes: max_seq_len and
+    // LinearAttentionMetadata::kRecurrentStates), and block reuse is disabled, we can allocate static memory for the
+    // linear attention states - max_batch_size blocks.
+    bool isStaticHybridModel = windowSizeToLayers.size() == 2
+        && windowSizeToLayers.count(LinearAttentionMetadata::LinearCacheType::kRecurrentStates) == 1
+        && linearAttentionMetadata.has_value() && !config.getEnableBlockReuse();
     bool const isVSWA = cacheSizeBytesPerTokenPerWindow.size() > 1;
 
     TLLM_LOG_DEBUG("extraCostMemory [Gib]: %0.2f", extraCostMemory / static_cast<double>(1 << 30));
@@ -3646,6 +3653,14 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
         auto memoryBudget = static_cast<uint64_t>(allottedPrimaryMemBytes * windowSizeShare);
         if (LinearAttentionMetadata::hasRecurrentStatesCache(windowSize))
         {
+            if (isStaticHybridModel)
+            {
+                TLLM_LOG_DEBUG(
+                    "Static hybrid model with linear attention states, allocating maxBatchSize (%d) blocks for window "
+                    "size %d",
+                    maxBatchSize, windowSize);
+                return maxBatchSize;
+            }
             TLLM_CHECK_WITH_INFO(linearAttentionMetadata.has_value(),
                 "Linear attention metadata must be provided when linear attention is used.");
             return linearAttentionMetadata->calcMaxMemoryBlocks(
@@ -3673,6 +3688,10 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
         auto memoryBudget = static_cast<uint64_t>(allottedSecondaryMemBytes * windowSizeShare);
         if (LinearAttentionMetadata::hasLinearCache(windowSize))
         {
+            if (isStaticHybridModel && memoryBudget > 0)
+            {
+                TLLM_LOG_WARNING("It's meaningless to allocate secondary memory when block reuse is disabled.");
+            }
             TLLM_CHECK_WITH_INFO(linearAttentionMetadata.has_value(),
                 "Linear attention metadata must be provided when linear attention is used.");
             return linearAttentionMetadata->calcMaxMemoryBlocks(
@@ -3731,6 +3750,30 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
         for (auto const& [windowSize, _] : windowSizeToLayers)
         {
             windowSizeToShare[windowSize] = 1.0f / windowSizeToLayers.size();
+        }
+
+        if (isStaticHybridModel)
+        {
+            for (auto const& [windowSize, _] : windowSizeToLayers)
+            {
+                windowSizeToShare[windowSize] = 1.0f;
+            }
+            windowSizeToShare[LinearAttentionMetadata::kRecurrentStates]
+                = 0.0f; // all memory goes to the main window size, and we will allocate static memory for linear
+                        // attention states
+            auto const staticMemoryBytes = maxBatchSize * linearAttentionMetadata->allRecurrentStatesBytes;
+            TLLM_CHECK_WITH_INFO(allottedPrimaryMemBytes > staticMemoryBytes,
+                "Not enough memory to allocate static cache for linear attention states. Required: %0.2f GiB, "
+                "Allotted: %0.2f GiB",
+                staticMemoryBytes / static_cast<double>(1 << 30),
+                allottedPrimaryMemBytes / static_cast<double>(1 << 30));
+            allottedPrimaryMemBytes -= staticMemoryBytes;
+            TLLM_LOG_INFO(
+                "Hybrid model with linear attention (mamba) detected. Reserving %0.2f GiB of GPU memory for static "
+                "allocation of linear attention states, leaving %0.2f GiB for dynamically allocated blocks for KV "
+                "cache.",
+                staticMemoryBytes / static_cast<double>(1 << 30),
+                allottedPrimaryMemBytes / static_cast<double>(1 << 30));
         }
     }
 
