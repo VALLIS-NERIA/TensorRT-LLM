@@ -365,37 +365,12 @@ class KVCacheManager(BaseResourceManager):
                                        1) if spec_config is not None else 0
         self.linear_attention_metadata = linear_attention_metadata
 
-        # Determine max_attention_window_vec
-        if kv_cache_config.max_attention_window is None:
-            # Use max_seq_len as default max_attention_window
-            self.max_attention_window_vec = [max_seq_len]
-        elif len(kv_cache_config.max_attention_window) == num_layers:
-            # we need to shard the max_attention_window according to the layer_mask and pp_layers
-            self.max_attention_window_vec = []
-            if layer_mask is not None:
-                global_enabled_layers = [
-                    layer_idx for layer_idx in range(len(layer_mask))
-                    if layer_mask[layer_idx]
-                ]
-            else:
-                global_enabled_layers = list(range(num_layers))
-            pp_rank_offset = global_enabled_layers.index(self.pp_layers[0])
-            for layer_idx in self.pp_layers:
-                if layer_mask is not None and not layer_mask[layer_idx]:
-                    continue
-                window_size = kv_cache_config.max_attention_window[
-                    pp_rank_offset + self.layer_offsets[layer_idx]]
-                window_size = min(window_size, max_seq_len)
-                self.max_attention_window_vec.append(window_size)
-        else:
-            self.max_attention_window_vec = kv_cache_config.max_attention_window.copy(
-            )  # Make a copy to avoid modifying original
-            # Clamp all window sizes to max_seq_len before calculating the
-            # number of KV cache blocks. This prevents the KV cache pool from
-            # being skewed by the largest window values.
-            self.max_attention_window_vec = [
-                min(max_seq_len, w) for w in self.max_attention_window_vec
-            ]
+        self.max_attention_window_vec = self._resolve_max_attention_window_vec(
+            kv_cache_config=kv_cache_config,
+            max_seq_len=max_seq_len,
+            num_layers=num_layers,
+            layer_mask=layer_mask,
+        )
 
         sink_token_length = (kv_cache_config.sink_token_length
                              if kv_cache_config.sink_token_length is not None
@@ -432,18 +407,6 @@ class KVCacheManager(BaseResourceManager):
                 for window_size in set(self.max_attention_window_vec)
             }
             if self.is_linear_attention:
-                if len(self.max_attention_window_vec) != self.num_layers:
-                    logger.info(
-                        f"Original max_attention_window_vec: {self.max_attention_window_vec}"
-                    )
-                    # self.max_attention_window_vec is a pattern, repeat it to match num_layers
-                    self.max_attention_window_vec = (
-                        self.max_attention_window_vec *
-                        (self.num_layers // len(self.max_attention_window_vec) +
-                         1))[:self.num_layers]
-                    logger.info(
-                        f"Adjusted max_attention_window_vec for linear attention: {self.max_attention_window_vec}"
-                    )
                 # max_tokens is already the affine-correct value computed
                 # upstream (_util.py:_tokens_for_budget honors the slope +
                 # intercept of CppMambaHybridCacheManager). Recurrent state
@@ -945,6 +908,51 @@ class KVCacheManager(BaseResourceManager):
         assert cache_size % quant_vector_size == 0, "NVFP4 cache size must be divisible by quant vector size"
         return get_size_in_bytes(cache_size // quant_vector_size,
                                  scaling_factor_dtype)
+
+    def _resolve_max_attention_window_vec(
+        self,
+        kv_cache_config: KvCacheConfig,
+        max_seq_len: int,
+        num_layers: int,
+        layer_mask: Optional[List[bool]],
+    ) -> List[int]:
+        """Compute the per-local-layer attention window vector.
+
+        Three input shapes are supported:
+
+        * ``max_attention_window is None``: use ``max_seq_len`` as the only
+          entry (single-window default).
+        * ``len(max_attention_window) == num_layers``: the user supplied a
+          global per-layer pattern. Shard it down to this PP rank using
+          ``layer_mask`` + ``self.pp_layers`` / ``self.layer_offsets``,
+          clamping each entry to ``max_seq_len``.
+        * Otherwise: use the user-supplied vector verbatim, clamped
+          element-wise to ``max_seq_len`` so the largest window can't skew
+          the KV cache pool sizing.
+        """
+        if kv_cache_config.max_attention_window is None:
+            return [max_seq_len]
+        if len(kv_cache_config.max_attention_window) == num_layers:
+            if layer_mask is not None:
+                global_enabled_layers = [
+                    layer_idx for layer_idx in range(len(layer_mask))
+                    if layer_mask[layer_idx]
+                ]
+            else:
+                global_enabled_layers = list(range(num_layers))
+            pp_rank_offset = global_enabled_layers.index(self.pp_layers[0])
+            sharded = []
+            for layer_idx in self.pp_layers:
+                if layer_mask is not None and not layer_mask[layer_idx]:
+                    continue
+                window_size = kv_cache_config.max_attention_window[
+                    pp_rank_offset + self.layer_offsets[layer_idx]]
+                sharded.append(min(window_size, max_seq_len))
+            return sharded
+        # General case: clamp each user-supplied entry to max_seq_len.
+        return [
+            min(max_seq_len, w) for w in kv_cache_config.max_attention_window
+        ]
 
     @staticmethod
     def _resolve_num_attention_layers(
@@ -1472,15 +1480,13 @@ class KVCacheManager(BaseResourceManager):
         rest of the dict.
         """
         primary_budget = self._primary_pool_memory_bytes - extra_cost_memory
-
         state_bytes_per_layer = (
             self.linear_attention_metadata.all_recurrent_states_bytes)
-        # Per-rank mamba layer count. self.pp_layers is 0-based local indices
-        # into this rank's layer slice; max_attention_window_vec is keyed by
-        # the same indexing.
-        num_mamba_layers_local = sum(1 for layer in self.pp_layers
-                                     if self.max_attention_window_vec[layer] ==
-                                     LinearCacheType.RECURRENT_STATES.value)
+
+        # max_attention_window_vec is already sharded by PP
+        num_mamba_layers_local = self.max_attention_window_vec.count(
+            LinearCacheType.RECURRENT_STATES.value)
+
         state_bytes_local = num_mamba_layers_local * state_bytes_per_layer
 
         attention_slope = self.get_cache_bytes_per_token()
@@ -1493,7 +1499,6 @@ class KVCacheManager(BaseResourceManager):
         # STATIC_SLOTS_PER_REQUEST = 1 (live state); fixed-position
         # snapshots are not yet implemented.
         intercept = self.max_batch_size * state_bytes_local
-
         if slope > 0:
             max_tokens = max((primary_budget - intercept) // slope, 0)
         else:
@@ -1501,17 +1506,12 @@ class KVCacheManager(BaseResourceManager):
         if kv_cache_config.max_tokens is not None:
             max_tokens = min(kv_cache_config.max_tokens, max_tokens)
 
-        blocks_in_primary_pool = int(max_tokens // self.tokens_per_block)
+        kv_blocks_in_primary_pool = int(max_tokens // self.tokens_per_block)
 
-        # Secondary host pool only mirrors attention KV blocks; mamba state
-        # never spills to host, so divide by attention slope only.
-        if attention_slope > 0:
-            max_tokens_secondary = (self._secondary_pool_memory_bytes //
-                                    attention_slope)
-        else:
-            max_tokens_secondary = 0
-        blocks_in_secondary_pool = int(max_tokens_secondary //
-                                       self.tokens_per_block)
+        # Secondary host pool is split in the same way as primary pool
+        kv_blocks_in_secondary_pool = int(kv_blocks_in_primary_pool *
+                                          (self._secondary_pool_memory_bytes /
+                                           self._primary_pool_memory_bytes))
 
         # Recurrent state slot count: live state per concurrent request, with
         # extra room for one regular snapshot per snapshot interval over the
@@ -1519,18 +1519,20 @@ class KVCacheManager(BaseResourceManager):
         max_snapshots = self.max_batch_size
         if (kv_cache_config.enable_block_reuse and interval is not None
                 and interval > 0):
-            max_snapshots = max(max_tokens // interval, self.max_batch_size)
+            max_snapshots += max_tokens // interval
 
+        secondary_snapshots = int(max_snapshots *
+                                  (self._secondary_pool_memory_bytes /
+                                   self._primary_pool_memory_bytes))
         # Build per-window dict: each unique attention window gets the same
         # (primary, secondary) attention block count; the recurrent-states
         # sentinel gets the snapshot pool.
         blocks_per_window = {
-            window_size: (blocks_in_primary_pool, blocks_in_secondary_pool)
-            for window_size in set(self.max_attention_window_vec)
-            if window_size != LinearCacheType.RECURRENT_STATES.value
+            self.max_seq_len:
+            (kv_blocks_in_primary_pool, kv_blocks_in_secondary_pool),
+            LinearCacheType.RECURRENT_STATES.value:
+            (max_snapshots, secondary_snapshots)
         }
-        blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
-            int(max_snapshots), 0)
         return blocks_per_window
 
     def calculate_max_num_blocks_for_vswa(
@@ -1696,6 +1698,8 @@ class KVCacheManager(BaseResourceManager):
         # Validate each window size in blocks_per_window against its upper bound
         for window_size, (blocks_in_primary_pool,
                           _) in blocks_per_window.items():
+            if window_size < 0:
+                continue
             upper_bound = self.get_max_atten_window_upper_bound(
                 blocks_in_primary_pool=blocks_in_primary_pool,
                 tokens_per_block=tokens_per_block,

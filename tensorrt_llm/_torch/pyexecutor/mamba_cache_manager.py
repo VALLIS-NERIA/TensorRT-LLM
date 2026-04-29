@@ -949,6 +949,24 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
             if is_mamba:
                 per_layer_kv_heads[i] = 0
 
+        # PP sharding is done across all layers.
+        # This is called again in the super().__init__, but we want it to run first
+        # to set up mtp states before the C++ backend is initialized.
+        self.pp_layers, _ = get_pp_layers(
+            mamba_num_layers + num_layers,
+            mapping,
+            spec_config=spec_config,
+            layer_mask=layer_mask,
+        )
+        self.mamba_pp_layers = [
+            layer_idx for layer_idx in self.pp_layers
+            if mamba_layer_mask[layer_idx]
+        ]
+        self.local_num_mamba_layers = len(self.mamba_pp_layers)
+
+        self.spec_config = spec_config
+        self._setup_mtp_intermediate_states()
+
         # pass remaining arguments to super class
         super().__init__(
             kv_cache_config,
@@ -966,12 +984,6 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
             is_estimating_kv_cache=is_estimating_kv_cache,
             linear_attention_metadata=self.linear_attention_metadata,
         )
-        # respect base class's pp sharding
-        self.mamba_pp_layers = []
-        for layer_idx in self.pp_layers:
-            if mamba_layer_mask[layer_idx]:
-                self.mamba_pp_layers.append(layer_idx)
-        self.local_num_mamba_layers = len(self.mamba_pp_layers)
 
         assert self.local_num_mamba_layers > 0, "At least one mamba layer is required"
         self.mamba_layer_offsets = {}
@@ -992,7 +1004,6 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
                                               device="cuda")
         self.kv_cache_config = kv_cache_config
         self.is_estimating_kv_cache = is_estimating_kv_cache
-        self.spec_config = spec_config
 
         self._setup_states()
 
@@ -1107,7 +1118,8 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
                                               max_beam_width,
                                               num_extra_decoding_steps,
                                               draft_kv_cache_manager)
-        self.requests.extend(requests)
+        if requests:
+            self.requests.extend(requests)
         self._setup_state_indices()
         return requests
 
@@ -1289,6 +1301,8 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
                                             self.local_num_mamba_layers,
                                             num_blocks_in_pool
                                         ] + self.conv_state_shape)
+
+    def _setup_mtp_intermediate_states(self) -> None:
         self.intermediate_ssm_states = None
         self.intermediate_conv_states = None
         self.intermediate_state_indices = None

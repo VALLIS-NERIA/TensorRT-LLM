@@ -122,11 +122,18 @@ class CacheCost:
         return CacheCost(slope=self.slope + other.slope,
                          intercept=self.intercept + other.intercept)
 
+    def __str__(self) -> str:
+        if self.intercept == 0:
+            return f"{self.slope} bytes/token"
+        else:
+            return f"{self.slope} bytes/token + {self.intercept} bytes fixed cost"
+
     def tokens_for_budget(self, budget: int) -> int:
         """Memory budget -> max tokens. Clamps a negative result to 0."""
         if self.slope <= 0:
             return 0
-        return max((budget - self.intercept) // self.slope, 0)
+        tokens = max((budget - self.intercept) // self.slope, 0)
+        return tokens
 
     def bytes_for_tokens(self, tokens: int) -> int:
         """Token count -> memory bytes."""
