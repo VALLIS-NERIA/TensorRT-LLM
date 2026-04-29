@@ -1072,7 +1072,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
 
         # Regular-snapshot bytes per token. None / non-positive intervals
         # mean "no regular snapshots", so the mamba contribution is zero.
-        interval = kv_cache_config.mamba_state_cache_interval
+        interval = kv_cache_config.mamba_state_cache_interval if kv_cache_config.enable_block_reuse else 0
         if interval is None or interval <= 0:
             mamba_slope = 0
         else:
