@@ -907,7 +907,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
         self.linear_attention_metadata = LinearAttentionMetadata()
         self.linear_attention_metadata.cache_type = LinearCacheType.RECURRENT_STATES.value
         self.linear_attention_metadata.all_recurrent_states_bytes = self.ssm_bytes + self.conv_bytes
-        self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_state_cache_interval
+        self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_state_cache_interval if kv_cache_config.enable_block_reuse else 0
         kv_cache_config = kv_cache_config.model_copy(deep=True)
         if kv_cache_config.enable_partial_reuse:
             logger.warning(
