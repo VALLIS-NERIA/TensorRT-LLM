@@ -738,6 +738,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         model_type: str = "nemotron_hybrid",
+        is_draft: bool = False,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -781,6 +782,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             layer_mask=layer_mask,
             is_estimating_kv_cache=is_estimating_kv_cache,
             execution_stream=execution_stream,
+            is_draft=is_draft,
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):

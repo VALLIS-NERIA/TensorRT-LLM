@@ -39,7 +39,6 @@ from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
-                                  MambaHybridCacheManager,
                                   MixedMambaHybridCacheManager,
                                   use_cpp_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
@@ -67,7 +66,15 @@ def _non_hybrid_kv_cache_manager_cls(kv_cache_config: KvCacheConfig):
 
 
 def get_kv_cache_manager_cls(model_config: ModelConfig,
-                             kv_cache_config: KvCacheConfig):
+                             kv_cache_config: KvCacheConfig,
+                             is_disagg: bool = False):
+    """Resolve the concrete KV cache manager class for ``model_config``.
+
+    For hybrid mamba models the choice between ``Mixed`` (separate pools,
+    needed for disagg / TRTLLM_USE_CPP_MAMBA) and ``Cpp`` (unified pool with
+    block reuse) is made here. Callers that don't care about disagg can omit
+    ``is_disagg`` and get the unified-pool default.
+    """
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
     if sparse_attn_config is not None:
@@ -79,10 +86,9 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
             logger.info("Hybrid linear model has 0 mamba layers; using "
                         "KVCacheManager without mamba caching")
             return _non_hybrid_kv_cache_manager_cls(kv_cache_config)
-        # Marker: concrete class (Mixed vs Cpp) is resolved by
-        # KvCacheCreator._get_model_kv_cache_manager_cls based on runtime
-        # context (is_disagg, env var).
-        return MambaHybridCacheManager
+        if is_disagg or use_cpp_mamba_cache_manager():
+            return MixedMambaHybridCacheManager
+        return CppMambaHybridCacheManager
     else:
         return _non_hybrid_kv_cache_manager_cls(kv_cache_config)
 
@@ -200,22 +206,8 @@ class KvCacheCreator:
 
     def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
         cls = get_kv_cache_manager_cls(model_engine.model.model_config,
-                                       self._kv_cache_config)
-        # Resolve hybrid mamba marker to a concrete implementation. Mirrors
-        # the routing previously done inside MambaHybridCacheManager.__new__:
-        # disagg / TRTLLM_USE_CPP_MAMBA=1 -> Mixed (separate pools); otherwise
-        # Cpp (unified pool, supports block reuse).
-        if cls is MambaHybridCacheManager:
-            if self._is_disagg or use_cpp_mamba_cache_manager():
-                logger.info(
-                    "Using MixedMambaHybridCacheManager for hybrid cache management"
-                )
-                cls = MixedMambaHybridCacheManager
-            else:
-                logger.info(
-                    "Using CppMambaHybridCacheManager for hybrid cache management"
-                )
-                cls = CppMambaHybridCacheManager
+                                       self._kv_cache_config,
+                                       is_disagg=self._is_disagg)
         if cls == KVCacheManagerV2:
             if self._kv_connector_manager is not None or (
                     self._max_beam_width is not None and self._max_beam_width
@@ -794,7 +786,9 @@ class KvCacheCreator:
 
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config, self._kv_cache_config)
+            effective_draft_config,
+            self._kv_cache_config,
+            is_disagg=self._is_disagg)
 
         # Use V2 if enabled and the base class is KVCacheManager
         if draft_kv_cache_manager_cls == KVCacheManagerV2:
