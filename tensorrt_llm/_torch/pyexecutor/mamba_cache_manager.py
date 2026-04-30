@@ -970,6 +970,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
+        self._use_replay_state_update = use_replay_state_update
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
         tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
         d_inner = mamba_head_dim * mamba_num_heads
@@ -977,6 +978,10 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
         nheads = mamba_num_heads
         assert nheads % tp_size == 0, "mamba_num_heads must be divisible by tp_size"
         assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
+        if use_replay_state_update:
+            assert mamba_n_groups % tp_size == 0, \
+                "replay state update requires mamba_n_groups divisible by tp_size"
+        self._n_groups_per_rank = mamba_n_groups // tp_size
         conv_dim = conv_dim // tp_size
         nheads = nheads // tp_size
         self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
@@ -1102,6 +1107,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
         self._setup_states()
+        self._setup_replay_buffers(spec_config)
 
     @staticmethod
     def get_cache_size_per_token(
@@ -1184,6 +1190,12 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
         self.intermediate_ssm_states = None
         self.intermediate_conv_states = None
         self.intermediate_state_indices = None
+        self.prev_num_accepted_tokens = None
+        self.cache_buf_idx = None
+        self.old_x = None
+        self.old_B = None
+        self.old_dt = None
+        self.old_dA_cumsum = None
         super().shutdown()
 
     def add_dummy_requests(
@@ -1234,6 +1246,16 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
             self.impl.copy_linear_attention_block(req)
         self.impl.refresh_blocks()
         self._setup_state_indices()
+        # Reset replay double-buffer state for fresh context blocks. A reused
+        # block (prefix-cache hit or block recycled across requests) may carry
+        # stale prev_num_accepted_tokens / cache_buf_idx values from a prior
+        # owner; the replay kernel reads these on the first decode step.
+        if self._use_replay_state_update and self.prev_num_accepted_tokens is not None:
+            num_contexts = len(scheduled_batch.context_requests)
+            if num_contexts > 0:
+                ctx_slots = self.cuda_state_indices[:num_contexts].long()
+                self.prev_num_accepted_tokens[ctx_slots] = 0
+                self.cache_buf_idx[ctx_slots] = 0
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
@@ -1258,12 +1280,23 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
 
         src_state_indices = self.intermediate_state_indices[:num_gens]
 
-        # Copy accepted SSM states from intermediate buffer back to pool
-        accepted_ssm = self.intermediate_ssm_states[:, src_state_indices,
-                                                    num_accepted_draft_tokens]
-        self.all_ssm_states[:, state_indices_d, :] = accepted_ssm
+        if self._use_replay_state_update:
+            # SSM state is handled incrementally by the replay kernel.  Update
+            # the per-slot accepted-token counter and flip the double-buffer
+            # index so the next step reads from the buffer that was just
+            # written by the precompute kernel.
+            accepted = num_accepted_tokens[num_contexts:num_contexts + num_gens]
+            self.prev_num_accepted_tokens[state_indices_d] = accepted.to(
+                self.prev_num_accepted_tokens.dtype)
+            self.cache_buf_idx[state_indices_d] = \
+                1 - self.cache_buf_idx[state_indices_d]
+        else:
+            # Legacy: copy accepted SSM states from intermediate buffer back to pool
+            accepted_ssm = self.intermediate_ssm_states[:, src_state_indices,
+                                                        num_accepted_draft_tokens]
+            self.all_ssm_states[:, state_indices_d, :] = accepted_ssm
 
-        # Copy accepted conv states from intermediate buffer back to pool
+        # Conv: both paths save all intermediate conv windows, carry over the accepted one.
         accepted_conv = self.intermediate_conv_states[:, src_state_indices,
                                                       num_accepted_draft_tokens]
         self.all_conv_states[:, state_indices_d, :] = accepted_conv
@@ -1296,12 +1329,27 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
         ssm = self.get_ssm_states(layer_idx)
         if self.spec_config is not None:
             layer_offset = self.mamba_layer_offsets[layer_idx]
+            spec_kwargs = {}
+            if self._use_replay_state_update:
+                # Per-layer slices for the replay kernel; shared 1D tensors
+                # (cache_buf_idx, prev_num_accepted_tokens) are passed
+                # untouched via the SpeculativeState._SHARED_FIELDS contract.
+                spec_kwargs['old_x'] = self.old_x[layer_offset]
+                spec_kwargs['old_B'] = self.old_B[layer_offset]
+                spec_kwargs['old_dt'] = self.old_dt[layer_offset]
+                spec_kwargs['old_dA_cumsum'] = self.old_dA_cumsum[layer_offset]
+                spec_kwargs['cache_buf_idx'] = self.cache_buf_idx
+                spec_kwargs['prev_num_accepted_tokens'] = (
+                    self.prev_num_accepted_tokens)
+            else:
+                spec_kwargs['intermediate_ssm'] = self.intermediate_ssm_states[
+                    layer_offset]
             return PythonMambaCacheManager.SpeculativeState(
                 conv=conv,
                 temporal=ssm,
-                intermediate_ssm=self.intermediate_ssm_states[layer_offset],
                 intermediate_conv_window=self.
                 intermediate_conv_states[layer_offset],
+                **spec_kwargs,
             )
         return PythonMambaCacheManager.State(conv=conv, temporal=ssm)
 
@@ -1404,18 +1452,30 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
         self.intermediate_ssm_states = None
         self.intermediate_conv_states = None
         self.intermediate_state_indices = None
+        # Replay tensors are sized by the recurrent-state pool block count and
+        # are allocated in _setup_replay_buffers after _setup_states().
+        self.prev_num_accepted_tokens = None
+        self.cache_buf_idx = None
+        self.old_x = None
+        self.old_B = None
+        self.old_dt = None
+        self.old_dA_cumsum = None
         if self.spec_config is not None:
             speculative_num_draft_tokens = self.spec_config.max_draft_len
             num_local_mamba_layers = len(self.mamba_pp_layers)
 
-            self.intermediate_ssm_states = torch.zeros(
-                size=[
-                    num_local_mamba_layers, max_batch_size,
-                    speculative_num_draft_tokens + 1
-                ] + self.ssm_state_shape,
-                dtype=self.ssm_state_dtype,
-                device="cuda",
-            )
+            # Legacy SSM intermediate buffer is only needed when replay is
+            # disabled; replay reads from the per-block double-buffered cache
+            # set up in _setup_replay_buffers instead.
+            if not self._use_replay_state_update:
+                self.intermediate_ssm_states = torch.zeros(
+                    size=[
+                        num_local_mamba_layers, max_batch_size,
+                        speculative_num_draft_tokens + 1
+                    ] + self.ssm_state_shape,
+                    dtype=self.ssm_state_dtype,
+                    device="cuda",
+                )
 
             self.intermediate_conv_states = torch.zeros(
                 size=[
@@ -1429,6 +1489,68 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
             self.intermediate_state_indices = torch.arange(max_batch_size,
                                                            dtype=torch.int32,
                                                            device="cuda")
+
+    def _setup_replay_buffers(self, spec_config) -> None:
+        """Allocate per-pool-block replay buffers used by replay_selective_state_update.
+
+        Unlike the Mixed cache manager (where slots are 0..max_batch_size-1),
+        the unified C++ KV pool assigns recurrent-state block indices up to
+        ``num_blocks_in_pool``. The replay kernel indexes ``cache_buf_idx`` and
+        ``prev_num_accepted_tokens`` by these block indices, so the buffers
+        must match the pool extent rather than ``max_batch_size``.
+        """
+        if spec_config is None or not self._use_replay_state_update:
+            return
+
+        T = spec_config.max_draft_len + 1
+        num_local_mamba_layers = self.local_num_mamba_layers
+        # all_ssm_states: [num_local_mamba_layers, num_blocks_in_pool, ...]
+        cache_size = self.all_ssm_states.shape[1]
+        nheads, head_dim, d_state = self.ssm_state_shape
+        n_groups_per_rank = self._n_groups_per_rank
+        device = self.all_ssm_states.device
+
+        # Shared across layers (consumed by the replay kernel via slot index).
+        self.prev_num_accepted_tokens = torch.zeros(cache_size,
+                                                    dtype=torch.int32,
+                                                    device=device)
+        self.cache_buf_idx = torch.zeros(cache_size,
+                                         dtype=torch.int32,
+                                         device=device)
+        # Per-layer double-buffered caches.
+        self.old_x = torch.zeros(num_local_mamba_layers,
+                                 cache_size,
+                                 T,
+                                 nheads,
+                                 head_dim,
+                                 dtype=self.conv_state_dtype,
+                                 device=device)
+        self.old_B = torch.zeros(num_local_mamba_layers,
+                                 cache_size,
+                                 2,
+                                 T,
+                                 n_groups_per_rank,
+                                 d_state,
+                                 dtype=self.conv_state_dtype,
+                                 device=device)
+        self.old_dt = torch.zeros(num_local_mamba_layers,
+                                  cache_size,
+                                  2,
+                                  nheads,
+                                  T,
+                                  dtype=torch.float32,
+                                  device=device)
+        self.old_dA_cumsum = torch.zeros(num_local_mamba_layers,
+                                         cache_size,
+                                         2,
+                                         nheads,
+                                         T,
+                                         dtype=torch.float32,
+                                         device=device)
+
+    @property
+    def use_replay_state_update(self) -> bool:
+        return self._use_replay_state_update
 
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self.ssm_state_dtype

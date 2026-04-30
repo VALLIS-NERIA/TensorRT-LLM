@@ -1132,10 +1132,7 @@ def _create_kv_cache_manager(
         # checkpoint after speculation. The next decode step replays forward
         # to correct it. If block reuse feeds that stale state into a new
         # prefill, the correction never happens.
-        if kv_cache_config.enable_block_reuse:
-            logger.info("Replay kernel incompatible with block reuse "
-                        "(stale SSM state); using legacy MTP path")
-            use_replay = False
+        # Currently we only save and reuse context tokens so this does not affect.
 
         # Tree attention: replay assumes linear token sequence.
         if (spec_config is not None
