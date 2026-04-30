@@ -964,8 +964,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
         ]
         self.local_num_mamba_layers = len(self.mamba_pp_layers)
 
-        self.spec_config = spec_config
-        self._setup_mtp_intermediate_states()
+        self._setup_mtp_intermediate_states(spec_config, max_batch_size)
 
         # pass remaining arguments to super class
         super().__init__(
@@ -1302,32 +1301,35 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
                                             num_blocks_in_pool
                                         ] + self.conv_state_shape)
 
-    def _setup_mtp_intermediate_states(self) -> None:
+    def _setup_mtp_intermediate_states(self, spec_config,
+                                       max_batch_size) -> None:
+        self.spec_config = spec_config
         self.intermediate_ssm_states = None
         self.intermediate_conv_states = None
         self.intermediate_state_indices = None
         if self.spec_config is not None:
             speculative_num_draft_tokens = self.spec_config.max_draft_len
             num_local_mamba_layers = len(self.mamba_pp_layers)
-            ssm_state_shape_tuple = tuple(self.ssm_state_shape)
-            conv_state_shape_tuple = tuple(self.conv_state_shape)
 
             self.intermediate_ssm_states = torch.zeros(
-                size=(num_local_mamba_layers, self.max_batch_size,
-                      speculative_num_draft_tokens + 1) + ssm_state_shape_tuple,
+                size=[
+                    num_local_mamba_layers, max_batch_size,
+                    speculative_num_draft_tokens + 1
+                ] + self.ssm_state_shape,
                 dtype=self.ssm_state_dtype,
                 device="cuda",
             )
 
             self.intermediate_conv_states = torch.zeros(
-                size=(num_local_mamba_layers, self.max_batch_size,
-                      speculative_num_draft_tokens + 1) +
-                conv_state_shape_tuple,
+                size=[
+                    num_local_mamba_layers, max_batch_size,
+                    speculative_num_draft_tokens + 1
+                ] + self.conv_state_shape,
                 dtype=self.conv_state_dtype,
                 device="cuda",
             )
 
-            self.intermediate_state_indices = torch.arange(self.max_batch_size,
+            self.intermediate_state_indices = torch.arange(max_batch_size,
                                                            dtype=torch.int32,
                                                            device="cuda")
 
