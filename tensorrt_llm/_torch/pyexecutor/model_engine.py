@@ -19,7 +19,8 @@ from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  trace_func)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
-                                            MultimodalRuntimeData)
+                                            MultimodalRuntimeData,
+                                            check_mm_embed_cumsum_if_needed)
 from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, TorchCompileConfig,
@@ -362,9 +363,9 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-            # PARD uses 2K tokens per gen request (K accepted + K masks), so
-            # its per-request draft buffer width is 2K-1 = max_total_draft_tokens.
-            if spec_config.spec_dec_mode.is_pard():
+            # PARD/DFlash use 2K tokens per gen request (K accepted + K masks), so
+            # their per-request draft buffer width is 2K-1 = max_total_draft_tokens.
+            if spec_config.spec_dec_mode.is_parallel_draft():
                 self.max_draft_len = self.max_total_draft_tokens
             else:
                 self.max_draft_len = spec_config.max_draft_len
@@ -745,6 +746,11 @@ class PyTorchModelEngine(ModelEngine):
                 )
                 return
 
+        # Create AutoTuner singleton in eager context before any compiled forward.
+        # Otherwise the first get() can happen inside torch.compile tracing and
+        # trigger non-traceable code (time.time(), torch.cuda.*) in the cache.
+        AutoTuner.get()
+
         can_run_general_warmup = (
             not self.is_draft_model and not self.mapping.has_cp_helix()
             and self.guided_decoder is None
@@ -765,7 +771,6 @@ class PyTorchModelEngine(ModelEngine):
                 # Memory pool will be warmed up later.
                 gc.collect()
                 torch.cuda.empty_cache()
-
         # Autotuner warmup uses context-only requests. Helix CP
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
@@ -2316,26 +2321,34 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq.append(past_seen_token_num)
             request.cached_tokens = num_cached_tokens_per_seq[-1]
 
-            # Multimodal
-            py_multimodal_runtime = MultimodalRuntimeData(
-                mm_token_lengths=request.multimodal_lengths,
-                mm_token_positions=request.multimodal_positions,
-                past_seen_token_num=past_seen_token_num,
-                chunk_end_pos=end_compute,
-                special_token_offsets=request.py_multimodal_data.get(
-                    'special_token_offsets', []),
-            ) if request.multimodal_hashes is not None else None
+            # Embed mask is required only for partial iterations (chunked
+            # prefill or KV-cache reuse); full-prefill degrades gracefully.
+            check_mm_embed_cumsum_if_needed(
+                request.py_multimodal_data,
+                begin_compute=past_seen_token_num,
+                end_compute=end_compute,
+                prompt_len=len(all_prompt_tokens),
+            )
+            mm_data = request.py_multimodal_data or {}
+            cumsum = mm_data.get('multimodal_embed_mask_cumsum')
+            py_multimodal_runtime = None
+            if cumsum is not None:
+                py_multimodal_runtime = MultimodalRuntimeData(
+                    embed_mask_cumsum=cumsum,
+                    past_seen_token_num=past_seen_token_num,
+                    chunk_end_pos=end_compute,
+                )
 
             multimodal_params = MultimodalParams(
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime)
             if multimodal_params.has_content():
                 if self.use_mrope:
-                    ctx_mrope_position_ids = multimodal_params.multimodal_data[
-                        'mrope_config'][
-                            'mrope_position_ids'][:, :,
-                                                  begin_compute:begin_compute +
-                                                  len(prompt_tokens)]
+                    mrope_pos_ids = multimodal_params.multimodal_data[
+                        'mrope_config']['mrope_position_ids']
+                    ctx_mrope_position_ids = mrope_pos_ids[:, :, begin_compute:
+                                                           begin_compute +
+                                                           len(prompt_tokens)]
                     # Record as (start_idx, end_idx, (3,1,L) mrope_pos_ids)
                     mrope_position_ids.append(
                         (len(position_ids) - len(prompt_tokens),
@@ -3816,10 +3829,10 @@ class PyTorchModelEngine(ModelEngine):
             # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
             spec_metadata.runtime_draft_len = self.runtime_draft_len
 
-            # PARD has 2K tokens per gen request, not K+1.  Pass 2K-1
+            # PARD/DFlash have 2K tokens per gen request, not K+1.  Pass 2K-1
             # so generation_lengths = 2K and the XQA kernel computes
             # the correct past_kv_len.
-            if spec_metadata.spec_dec_mode.is_pard():
+            if spec_metadata.spec_dec_mode.is_parallel_draft():
                 sd_max_draft_len = self.original_max_total_draft_tokens
                 sd_max_total = self.original_max_total_draft_tokens
             else:
@@ -4044,6 +4057,10 @@ class PyTorchModelEngine(ModelEngine):
         if not multimodal_params or len(multimodal_params) == 0:
             # Return empty embeddings if no multimodal data
             return {'mm_embeddings': []}
+        # TODO(TRTLLM-12175): split encoder outputs by explicit per-request
+        # encoder-output embedding lengths. multimodal_lengths is a
+        # prompt-side MM-token count and may include non-embedding
+        # special/framing tokens.
         if getattr(scheduled_requests.context_requests[0], 'multimodal_lengths',
                    None) is None:
             multimodal_chunks = None
