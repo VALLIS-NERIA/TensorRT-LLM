@@ -48,6 +48,26 @@ from .ssd_combined import mamba_chunk_scan_combined
 
 
 class Mamba2Mixer(nn.Module):
+    FLAG = torch.zeros([1], dtype=torch.int32, device='cuda')
+    # Host-pinned mirror of FLAG. Updated via async copy after every fill_,
+    # so it remains readable even after a CUDA error invalidates the context.
+    FLAG_HOST = torch.zeros([1], dtype=torch.int32, pin_memory=True)
+    # Track the most recently entered NemotronHLayer's layer_idx, mirrored to
+    # host pinned memory. Combined with FLAG_HOST it tells us "crash at flag X
+    # in layer Y".
+    LAYER_IDX = torch.zeros([1], dtype=torch.int32, device='cuda')
+    LAYER_IDX_HOST = torch.zeros([1], dtype=torch.int32, pin_memory=True)
+
+    @staticmethod
+    def _set_flag(v: int):
+        Mamba2Mixer.FLAG.fill_(v)
+        Mamba2Mixer.FLAG_HOST.copy_(Mamba2Mixer.FLAG, non_blocking=True)
+
+    @staticmethod
+    def _set_layer(idx: int):
+        Mamba2Mixer.LAYER_IDX.fill_(idx)
+        Mamba2Mixer.LAYER_IDX_HOST.copy_(Mamba2Mixer.LAYER_IDX,
+                                         non_blocking=True)
 
     def __init__(
         self,

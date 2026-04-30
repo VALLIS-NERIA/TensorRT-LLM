@@ -3791,6 +3791,7 @@ class PyTorchModelEngine(ModelEngine):
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!ModelEngine forward called!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
@@ -3928,6 +3929,9 @@ class PyTorchModelEngine(ModelEngine):
                             inputs,
                             gather_ids=gather_ids,
                             gather_context_logits=gather_context_logits)
+                    from tensorrt_llm._torch.modules.mamba.mamba2_mixer import Mamba2Mixer
+                    print(Mamba2Mixer.FLAG_HOST)
+                    Mamba2Mixer._set_flag(-1)
                 else:
                     if self.cuda_graph_runner.needs_capture(key):
 
@@ -3961,9 +3965,15 @@ class PyTorchModelEngine(ModelEngine):
                             attn_metadata, draft_kv_cache_manager)
                         try:
                             with MoeLoadBalancerIterContext(moe_load_balancer):
+                                torch.cuda.synchronize()
                                 outputs = self.cuda_graph_runner.replay(
                                     key, inputs)
+                                torch.cuda.synchronize()
                         finally:
+                            from tensorrt_llm._torch.modules.mamba.mamba2_mixer import Mamba2Mixer
+                            print(Mamba2Mixer.FLAG_HOST)
+                            print(Mamba2Mixer.LAYER_IDX_HOST)
+                            Mamba2Mixer._set_flag(-1)
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
 

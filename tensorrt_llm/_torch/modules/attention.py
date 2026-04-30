@@ -871,10 +871,19 @@ class Attention(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
+        # Debug flags (Mamba2Mixer.{FLAG,LAYER_IDX}_HOST). 7xxx series brackets
+        # the attention forward stages; combine with LAYER_IDX_HOST to know
+        # which attention layer crashed.
+        from tensorrt_llm._torch.modules.mamba.mamba2_mixer import \
+            Mamba2Mixer as _DbgM
+        _DbgM._set_flag(7000)
+
         hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
                                                   self.mapping, self.layer_idx)
+        _DbgM._set_flag(7050)
 
         qkv = self.qkv_proj(hidden_states)
+        _DbgM._set_flag(7100)
 
         if bool(lora_params):
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
@@ -886,6 +895,7 @@ class Attention(nn.Module):
                                            self.layer_idx)
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
+        _DbgM._set_flag(7200)
 
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -898,6 +908,7 @@ class Attention(nn.Module):
             ]
         else:
             q, k, v = qkv, None, None
+        _DbgM._set_flag(7300)
 
         # For dynamic tree spec decoding with Python RoPE, adjust position_ids
         # to use tree offsets (same as C++ kernel: past_seq_len + offset).
@@ -914,10 +925,12 @@ class Attention(nn.Module):
 
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
+        _DbgM._set_flag(7400)
 
         if attention_sinks is not None:
             assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
 
+        _DbgM._set_flag(7500)
         attn_output = self.forward_impl(q,
                                         k,
                                         v,
@@ -928,6 +941,7 @@ class Attention(nn.Module):
                                         mrope_config=mrope_config,
                                         attention_sinks=attention_sinks,
                                         has_lora=bool(lora_params))
+        _DbgM._set_flag(7600)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
@@ -938,6 +952,7 @@ class Attention(nn.Module):
                                                   all_reduce_params,
                                                   self.mapping, self.mapping_o,
                                                   self.layer_idx, lora_params)
+        _DbgM._set_flag(7700)
         return attn_output
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
