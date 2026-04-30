@@ -1315,10 +1315,12 @@ class MambaHybridCacheManager(metaclass=_MambaHybridCacheManagerMeta):
             kv_cache_config,
             kv_cache_type,
         )
-        use_reuse = kv_cache_config is not None and kv_cache_config.enable_block_reuse
-        use_v1_mamba_manager = not use_reuse
 
-        if use_v1_mamba_manager:
+        spec_config = kwargs.get('spec_config', None)
+        use_v1 = (is_disagg or use_cpp_mamba_cache_manager()
+                  or spec_config is not None)
+
+        if use_v1:
             logger.info(
                 "Using MixedMambaHybridCacheManager for hybrid cache management"
             )
