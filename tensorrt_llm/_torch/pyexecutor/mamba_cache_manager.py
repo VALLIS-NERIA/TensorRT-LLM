@@ -928,8 +928,7 @@ def calc_context_stop_positions(prompt_len: int,
     return stop_positions
 
 
-class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
-                                 MambaHybridCacheManager):
+class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     """Hybrid cache manager storing mamba states inside the KVCacheManager pool.
 
     Both KV cache blocks and recurrent state blocks are managed by the unified
