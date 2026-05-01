@@ -127,6 +127,22 @@ class MambaKVCacheParams:
     mamba_ssm_cache_dtype: Optional[
         torch.dtype]  # quant_config.mamba_ssm_cache_dtype
 
+    def get_states_bytes_per_layer(self, mapping) -> int:
+        """Return the total bytes of Mamba state per layer, used for budgeting."""
+        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        d_inner = self.head_dim * self.num_heads
+        conv_dim = (d_inner + 2 * self.n_groups * self.state_size) // tp_size
+        nheads = self.num_heads // tp_size
+
+        conv_dtype = self.dtype
+        ssm_dtype = (self.mamba_ssm_cache_dtype
+                     if self.mamba_ssm_cache_dtype is not None else self.dtype)
+        conv_bytes = conv_dim * (self.conv_kernel - 1) * conv_dtype.itemsize
+        ssm_bytes = (nheads * self.head_dim * self.state_size *
+                     ssm_dtype.itemsize)
+        state_bytes_per_layer = conv_bytes + ssm_bytes
+        return state_bytes_per_layer
+
 
 def _nemotron_hybrid_layer_masks(config, layer_mask):
     pattern = config.hybrid_override_pattern

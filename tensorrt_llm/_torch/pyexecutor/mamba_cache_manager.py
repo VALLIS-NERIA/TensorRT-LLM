@@ -1145,22 +1145,12 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
             quant_config=model_config.quant_config,
         )
 
-        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
-        d_inner = params.head_dim * params.num_heads
-        conv_dim = (d_inner +
-                    2 * params.n_groups * params.state_size) // tp_size
-        nheads = params.num_heads // tp_size
+        state_bytes_per_layer = params.get_states_bytes_per_layer(mapping)
 
-        conv_dtype = params.dtype
-        ssm_dtype = (params.mamba_ssm_cache_dtype if
-                     params.mamba_ssm_cache_dtype is not None else params.dtype)
-        conv_bytes = conv_dim * (params.conv_kernel - 1) * conv_dtype.itemsize
-        ssm_bytes = (nheads * params.head_dim * params.state_size *
-                     ssm_dtype.itemsize)
-        state_bytes_per_layer = conv_bytes + ssm_bytes
-
-        # Per-rank mamba layer count, mirroring how the parent slices PP for
-        # attention (len(mapping.pp_layers(global_attn_count))).
+        # This not precise since pp layers are sharded by their order in model, not by their types.
+        # e.g. the upper half are all mamba layers while the lower half are all attention layers.
+        # But that's close enough for real world models where mamba and attention layers are interleaved
+        # and we don't have access with layer_masks at this point.
         num_mamba_layers_per_rank = len(
             mapping.pp_layers(params.num_mamba_layers))
         state_bytes_per_rank = num_mamba_layers_per_rank * state_bytes_per_layer
@@ -1179,7 +1169,12 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
             mamba_slope = 0
         else:
             mamba_slope = state_bytes_per_rank // interval
-
+        # heuristic: When block reuse is enabled, we assume the mamba snapshots are dominant instead of active states,
+        # otherwise we may run out of kv cache blocks prior to mamba blocks due to the large number of max_batch_size.
+        # So we ignore intercept and only calculate max_tokens based on slope
+        # This can be improved by a more accurate max_batch_size and ISL/OSL estimation in the future.
+        if mamba_slope > 0:
+            intercept = 0
         return attention_slope + mamba_slope, intercept
 
     def shutdown(self):
@@ -1383,9 +1378,18 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
             max_blocks = self.blocks_per_window[
                 LinearCacheType.RECURRENT_STATES.value][0]
             if value < 0 or value >= max_blocks:
+                req = self.requests[i]
                 raise RuntimeError(
                     f"Invalid recurrent state block index {value} "
-                    f"(expected 0 <= index < {max_blocks}) for request {i}")
+                    f"(expected 0 <= index < {max_blocks}) for request {i}, "
+                    f"prompt_len={req.prompt_len}, "
+                    f"is_context_finished={req.is_context_finished}, "
+                    f"context_current_position={req.context_current_position}, "
+                    f"prepopulated_token_num={req.prepopulated_prompt_len}, "
+                    f"context_chunk_size={req.context_chunk_size if not req.is_context_finished else 'N/A'}, "
+                    f"block_index for next step is {block_indices[i]}, "
+                    f"\nblock_ids={self.impl.get_cache_block_ids(req.py_request_id, LinearCacheType.RECURRENT_STATES.value)}"
+                )
             host_block_offsets[i] = value
 
         torch.fill_(self.cuda_state_indices, 0)

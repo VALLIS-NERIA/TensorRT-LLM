@@ -1529,10 +1529,15 @@ class KVCacheManager(BaseResourceManager):
         # STATIC_SLOTS_PER_REQUEST = 1 (live state); fixed-position
         # snapshots are not yet implemented.
         intercept = self.max_batch_size * state_bytes_local
-        if slope > 0:
-            max_tokens = max((primary_budget - intercept) // slope, 0)
+
+        # heuristic: When block reuse is enabled, we assume the mamba snapshots are dominant instead of active states,
+        # otherwise we may run out of kv cache blocks prior to mamba blocks due to the large number of max_batch_size.
+        # So we ignore intercept and only calculate max_tokens based on slope
+        # This can be improved by a more accurate max_batch_size and ISL/OSL estimation in the future.
+        if mamba_slope > 0:
+            max_tokens = max((primary_budget) // slope, 0)
         else:
-            max_tokens = 0
+            max_tokens = max((primary_budget - intercept) // slope, 0)
         if kv_cache_config.max_tokens is not None:
             max_tokens = min(kv_cache_config.max_tokens, max_tokens)
 
@@ -1549,7 +1554,7 @@ class KVCacheManager(BaseResourceManager):
         max_snapshots = self.max_batch_size
         if (kv_cache_config.enable_block_reuse and interval is not None
                 and interval > 0):
-            max_snapshots += max_tokens // interval
+            max_snapshots = max_tokens // interval
 
         secondary_snapshots = int(max_snapshots *
                                   (self._secondary_pool_memory_bytes /
