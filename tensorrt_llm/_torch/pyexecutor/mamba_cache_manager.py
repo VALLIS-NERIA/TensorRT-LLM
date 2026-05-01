@@ -780,7 +780,7 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
                                        state_indices)
 
 
-class MambaHybridCacheManager:
+class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
     """Marker base class for hybrid mamba cache manager implementations.
 
     Used purely for ``isinstance`` / type-hint purposes so callers can refer
@@ -1250,7 +1250,8 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
             if num_contexts > 0:
                 ctx_slots = self.cuda_state_indices[:num_contexts].long()
                 self.prev_num_accepted_tokens[ctx_slots] = 0
-                self.cache_buf_idx[ctx_slots] = 0
+                # don't care which half of doulbe-buffer is using
+                # self.cache_buf_idx[ctx_slots] = 0
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
@@ -1456,14 +1457,6 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
         self.intermediate_ssm_states = None
         self.intermediate_conv_states = None
         self.intermediate_state_indices = None
-        # Replay tensors are sized by the recurrent-state pool block count and
-        # are allocated in _setup_replay_buffers after _setup_states().
-        self.prev_num_accepted_tokens = None
-        self.cache_buf_idx = None
-        self.old_x = None
-        self.old_B = None
-        self.old_dt = None
-        self.old_dA_cumsum = None
         if self.spec_config is not None:
             speculative_num_draft_tokens = self.spec_config.max_draft_len
             num_local_mamba_layers = len(self.mamba_pp_layers)
@@ -1504,6 +1497,14 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
         must match the pool extent rather than ``max_batch_size``.
         """
         if spec_config is None or not self._use_replay_state_update:
+            # Replay tensors are sized by the recurrent-state pool block count and
+            # are allocated in _setup_replay_buffers after _setup_states().
+            self.prev_num_accepted_tokens = None
+            self.cache_buf_idx = None
+            self.old_x = None
+            self.old_B = None
+            self.old_dt = None
+            self.old_dA_cumsum = None
             return
 
         T = spec_config.max_draft_len + 1
@@ -1521,7 +1522,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
         self.cache_buf_idx = torch.zeros(cache_size,
                                          dtype=torch.int32,
                                          device=device)
-        # Per-layer double-buffered caches.
+        # x is not double-buffered
         self.old_x = torch.zeros(num_local_mamba_layers,
                                  cache_size,
                                  T,
@@ -1529,6 +1530,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager,
                                  head_dim,
                                  dtype=self.conv_state_dtype,
                                  device=device)
+        # Per-layer double-buffered caches.
         self.old_B = torch.zeros(num_local_mamba_layers,
                                  cache_size,
                                  2,
