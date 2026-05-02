@@ -1259,8 +1259,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def is_speculative(self) -> bool:
         return self.spec_config is not None
 
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor):
+    def update_mamba_states(self,
+                            attn_metadata: "AttentionMetadata",
+                            num_accepted_tokens: torch.Tensor,
+                            state_indices: Optional[torch.Tensor] = None):
         # Note: cannot use @torch.compile here because all_ssm_states and
         # all_conv_states are dtype-reinterpreted views of the C++ pool
         # (uint8 -> typed), and aot_autograd does not support mutations on
@@ -1270,8 +1272,13 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         num_gens = batch_size - num_contexts
         num_accepted_draft_tokens = num_accepted_tokens[
             num_contexts:num_contexts + num_gens] - 1
-        state_indices_d = self.get_state_indices()[num_contexts:num_contexts +
-                                                   num_gens]
+        # Match the API of MambaCacheManager.update_mamba_states: callers
+        # may pass per-request state slot indices explicitly (e.g. MTP via
+        # attn_metadata.mamba_metadata.state_indices). Fall back to this
+        # manager's own slot mapping when not provided.
+        if state_indices is None:
+            state_indices = self.get_state_indices()
+        state_indices_d = state_indices[num_contexts:num_contexts + num_gens]
 
         src_state_indices = self.intermediate_state_indices[:num_gens]
 
