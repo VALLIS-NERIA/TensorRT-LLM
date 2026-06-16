@@ -16,9 +16,10 @@ import gc
 import json
 import math
 import os
+import random
 import tempfile
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import pytest
 import scipy
@@ -263,6 +264,176 @@ class AccuracyTask:
         hypothesis_testing_params.assert_passing(score)
 
 
+@dataclass(slots=True)
+class _RepeatShuffleSample:
+    prompt: Any
+    sampling_params: SamplingParams
+
+
+class RepeatShuffleReuseAccuracyTask(AccuracyTask):
+    REPEAT_SHUFFLE_GROUP_SIZE = 4
+    REPEAT_SHUFFLE_NUM_GROUPS = 2
+    REPEAT_SHUFFLE_SEED = 0
+
+    def _build_evaluator(self, extra_evaluator_kwargs: Optional[dict],
+                         num_samples: int):
+        evaluator_kwargs = {}
+        if self.EVALUATOR_KWARGS is not None:
+            evaluator_kwargs.update(self.EVALUATOR_KWARGS)
+        if extra_evaluator_kwargs is not None:
+            evaluator_kwargs.update(extra_evaluator_kwargs)
+        return self.EVALUATOR_CLS(num_samples=num_samples, **evaluator_kwargs)
+
+    def _collect_evaluator_samples(
+            self, llm: Union[LLM, PyTorchLLM, AutoDeployLLM], evaluator,
+            sampling_params: SamplingParams,
+            num_samples: int) -> List[_RepeatShuffleSample]:
+        samples = []
+        try:
+            sample_iter = evaluator.generate_samples()
+            for prompt, sampling_args, *_ in sample_iter:
+                if evaluator.apply_chat_template:
+                    prompt = evaluator.do_apply_chat_template(llm, prompt)
+                sample_sampling_params = evaluator._get_sampline_params(
+                    sampling_params, sampling_args)
+                samples.append(
+                    _RepeatShuffleSample(prompt, sample_sampling_params))
+                if len(samples) >= num_samples:
+                    break
+        except NotImplementedError:
+            samples = []
+        return samples
+
+    def _collect_lm_eval_samples(
+            self, llm: Union[LLM, PyTorchLLM, AutoDeployLLM], evaluator,
+            sampling_params: SamplingParams, streaming: bool,
+            num_samples: int) -> List[_RepeatShuffleSample]:
+        from lm_eval.evaluator import get_sample_size, get_task_list
+
+        from tensorrt_llm.evaluate.lm_eval import LmEvalWrapper
+
+        lm = LmEvalWrapper(
+            llm,
+            sampling_params=sampling_params,
+            streaming=streaming,
+            chat_template_kwargs=evaluator.chat_template_kwargs,
+        )
+        samples = []
+        for task_output in get_task_list(evaluator.task_dict):
+            task = task_output.task
+            limit = get_sample_size(task, num_samples)
+            task.build_all_requests(
+                limit=limit,
+                rank=lm.rank,
+                world_size=lm.world_size,
+                cache_requests=False,
+                rewrite_requests_cache=False,
+                system_instruction=evaluator.system_prompt,
+                apply_chat_template=bool(evaluator.apply_chat_template),
+                fewshot_as_multiturn=evaluator.fewshot_as_multiturn,
+                chat_template=getattr(lm, "apply_chat_template", None)
+                if evaluator.apply_chat_template else None,
+                tokenizer_name=getattr(lm, "tokenizer_name", "")
+                if evaluator.apply_chat_template else "",
+            )
+            for instance in task.instances:
+                if instance.request_type != "generate_until":
+                    continue
+                prompt, gen_kwargs = instance.args
+                sample_sampling_params = lm._get_sampling_params(
+                    dict(gen_kwargs or {}))
+                if sampling_params.max_tokens is not None:
+                    sample_sampling_params.max_tokens = sampling_params.max_tokens
+                samples.append(
+                    _RepeatShuffleSample(prompt, sample_sampling_params))
+                if len(samples) >= num_samples:
+                    return samples
+        return samples
+
+    def _collect_samples(self, llm: Union[LLM, PyTorchLLM,
+                                          AutoDeployLLM], evaluator,
+                         sampling_params: SamplingParams, streaming: bool,
+                         num_samples: int) -> List[_RepeatShuffleSample]:
+        samples = self._collect_evaluator_samples(llm, evaluator,
+                                                  sampling_params, num_samples)
+        if len(samples) < num_samples and hasattr(evaluator, "task_dict"):
+            samples = self._collect_lm_eval_samples(llm, evaluator,
+                                                    sampling_params, streaming,
+                                                    num_samples)
+        if len(samples) < num_samples:
+            raise ValueError(
+                f"Only collected {len(samples)} samples for {self.DATASET}; "
+                f"expected at least {num_samples}.")
+        return samples
+
+    def _run_samples(self, llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
+                     samples: List[_RepeatShuffleSample], streaming: bool):
+        outputs = [
+            llm.generate_async(sample.prompt,
+                               sampling_params=sample.sampling_params,
+                               streaming=streaming) for sample in samples
+        ]
+        return [output.result() for output in outputs]
+
+    def evaluate(self,
+                 llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
+                 extra_acc_spec: Optional[str] = None,
+                 extra_evaluator_kwargs: Optional[dict] = None,
+                 sampling_params: Optional[SamplingParams] = None,
+                 streaming: bool = False,
+                 is_integration_test: bool = False):
+        del extra_acc_spec, is_integration_test
+        assert self.EVALUATOR_CLS is not None
+        if streaming:
+            raise ValueError(
+                "Repeat-shuffle reuse evaluation does not support streaming.")
+
+        if sampling_params is None:
+            sampling_params = SamplingParams(
+                max_tokens=self.MAX_OUTPUT_LEN,
+                truncate_prompt_tokens=self.MAX_INPUT_LEN)
+        else:
+            if sampling_params.max_tokens is None:
+                sampling_params.max_tokens = self.MAX_OUTPUT_LEN
+            if sampling_params.truncate_prompt_tokens is None:
+                sampling_params.truncate_prompt_tokens = self.MAX_INPUT_LEN
+
+        num_samples = (self.REPEAT_SHUFFLE_GROUP_SIZE *
+                       self.REPEAT_SHUFFLE_NUM_GROUPS)
+        evaluator = self._build_evaluator(extra_evaluator_kwargs, num_samples)
+        samples = self._collect_samples(llm, evaluator, sampling_params,
+                                        streaming, num_samples)
+
+        rng = random.Random(self.REPEAT_SHUFFLE_SEED)
+        for group_idx in range(self.REPEAT_SHUFFLE_NUM_GROUPS):
+            start = group_idx * self.REPEAT_SHUFFLE_GROUP_SIZE
+            end = start + self.REPEAT_SHUFFLE_GROUP_SIZE
+            group = samples[start:end]
+            first_outputs = self._run_samples(llm, group, streaming)
+
+            order = list(range(len(group)))
+            rng.shuffle(order)
+            shuffled_group = [group[idx] for idx in order]
+            second_outputs = self._run_samples(llm, shuffled_group, streaming)
+            second_outputs_by_original_idx = {
+                original_idx: output
+                for original_idx, output in zip(order, second_outputs)
+            }
+
+            for sample_idx, first_output in enumerate(first_outputs):
+                first_token_ids = first_output.outputs[0].token_ids
+                second_token_ids = second_outputs_by_original_idx[
+                    sample_idx].outputs[0].token_ids
+                assert len(first_token_ids) > 0
+                assert first_token_ids == second_token_ids, (
+                    f"Repeat-shuffle reuse output mismatch for {self.DATASET} "
+                    f"group {group_idx}, sample {sample_idx}.")
+
+        logger.info(f"Repeat-shuffle reuse check passed for {self.DATASET}: "
+                    f"{self.REPEAT_SHUFFLE_NUM_GROUPS} groups, "
+                    f"{self.REPEAT_SHUFFLE_GROUP_SIZE} samples per group.")
+
+
 class VoxPopuli(AccuracyTask):
     """ASR accuracy task on the facebook/voxpopuli dataset, scored by WER (lower is better)."""
 
@@ -413,6 +584,14 @@ class GSM8K(AccuracyTask):
     EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
 
     EVALUATE_KWARGS = dict(scores_filter=None)
+
+
+class MMLURepeatShuffleReuse(RepeatShuffleReuseAccuracyTask, MMLU):
+    pass
+
+
+class GSM8KRepeatShuffleReuse(RepeatShuffleReuseAccuracyTask, GSM8K):
+    pass
 
 
 class GPQADiamond(AccuracyTask):

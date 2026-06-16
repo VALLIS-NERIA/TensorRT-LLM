@@ -250,6 +250,9 @@ def test_calc_context_stop_positions_save_last_snapshot():
     assert calc_context_stop_positions(
         prompt_len=70, tokens_per_block=32, mamba_state_cache_interval=256, save_last_snapshot=True
     ) == [64, 70]
+    assert calc_context_stop_positions(64, 32, 256, True) == [32, 64]
+    assert calc_context_stop_positions(128, 32, 64, True) == [64, 96, 128]
+    assert calc_context_stop_positions(8192, 32, None, True) == [8160, 8192]
     assert calc_context_stop_positions(70, 32, 256, False) == [70]
     assert calc_context_stop_positions(16, 32, 256, True) == [16]
     assert calc_context_stop_positions(70, 32, 0, True) == [64, 70]
@@ -314,6 +317,22 @@ def test_cpp_hybrid_next_state_step_falls_back_to_actual_chunk_end():
     assert mgr._get_next_recurrent_state_step(request) == 127
 
 
+def test_cpp_hybrid_next_context_chunk_size_uses_reuse_save_last_points():
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=0)
+    mgr.tokens_per_block = 32
+    mgr.linear_attention_metadata = SimpleNamespace(
+        states_snapshot_interval=0, save_last_snapshot=True
+    )
+    request = SimpleNamespace(prompt_len=70, context_current_position=0)
+
+    assert mgr.calc_next_context_chunk_size(request) == 64
+    request.context_current_position = 64
+    assert mgr.calc_next_context_chunk_size(request) == 6
+    request.context_current_position = 70
+    assert mgr.calc_next_context_chunk_size(request) == 0
+
+
 @skip_no_cuda
 def test_cpp_get_state_indices_resolves_sentinel_to_reserved_slot():
     """End-to-end C++ path: add_dummy_requests + getStateIndices must
@@ -365,6 +384,7 @@ def _build_hybrid_with_mamba_layer(
     max_batch_size=4,
     enable_block_reuse=False,
     mamba_state_cache_interval=None,
+    mamba_save_last_snapshot=True,
     is_estimating_kv_cache=False,
 ):
     """Construct a real CppMambaHybridCacheManager with one mamba layer +
@@ -381,6 +401,7 @@ def _build_hybrid_with_mamba_layer(
         max_tokens=512,
         enable_block_reuse=enable_block_reuse,
         mamba_state_cache_interval=mamba_state_cache_interval,
+        mamba_save_last_snapshot=mamba_save_last_snapshot,
     )
     return CppMambaHybridCacheManager(
         mamba_d_state=8,
@@ -542,6 +563,24 @@ def test_cpp_hybrid_recurrent_pool_floor_with_block_reuse():
         f"recurrent-state pool has {recurrent_primary} slots with block reuse enabled, "
         f"need >= max_batch_size + 1 = {max_batch_size + 1} to prevent the padding "
         f"sentinel from evicting live recurrent state"
+    )
+
+
+@skip_no_cuda
+def test_cpp_hybrid_recurrent_pool_adds_save_last_slots_with_block_reuse():
+    max_batch_size = 4
+    mgr = _build_hybrid_with_mamba_layer(
+        spec_config=None,
+        max_batch_size=max_batch_size,
+        enable_block_reuse=True,
+        mamba_state_cache_interval=0,
+        mamba_save_last_snapshot=True,
+    )
+    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
+    expected_min = max_batch_size + 1 + max_batch_size
+    assert recurrent_primary >= expected_min, (
+        f"recurrent-state pool has {recurrent_primary} slots with save-last reuse enabled, "
+        f"need >= live_state + padding + last_snapshot_slots = {expected_min}"
     )
 
 

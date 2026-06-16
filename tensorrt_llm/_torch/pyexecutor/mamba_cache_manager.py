@@ -1199,7 +1199,9 @@ def calc_context_stop_positions(prompt_len: int,
     """Compute token positions at which mamba state snapshots should be saved.
 
     Returns positions spaced by ``mamba_state_cache_interval`` plus the final
-    prompt length (and optionally the last block-aligned position).
+    prompt length. When ``save_last_snapshot`` is enabled, also includes the
+    end of the second-to-last context block, which is the last full block
+    recoverable by context block storage.
     """
     stop_positions = []
     if mamba_state_cache_interval is not None and mamba_state_cache_interval > 0:
@@ -1207,7 +1209,7 @@ def calc_context_stop_positions(prompt_len: int,
             range(mamba_state_cache_interval, prompt_len,
                   mamba_state_cache_interval))
 
-    last_ckpt = prompt_len // tokens_per_block * tokens_per_block
+    last_ckpt = ((prompt_len - 1) // tokens_per_block) * tokens_per_block
     if save_last_snapshot and last_ckpt > 0:
         stop_positions.append(last_ckpt)
     stop_positions.append(prompt_len)

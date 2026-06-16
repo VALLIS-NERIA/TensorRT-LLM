@@ -102,9 +102,9 @@ std::vector<SizeType32> calcContextStopPositions(
         }
     }
 
-    if (saveLastSnapshot && tokensPerBlock > 0)
+    if (saveLastSnapshot && tokensPerBlock > 0 && promptLen > 0)
     {
-        auto const lastCheckpoint = promptLen / tokensPerBlock * tokensPerBlock;
+        auto const lastCheckpoint = ((promptLen - 1) / tokensPerBlock) * tokensPerBlock;
         if (lastCheckpoint > 0)
         {
             stopPositions.push_back(lastCheckpoint);

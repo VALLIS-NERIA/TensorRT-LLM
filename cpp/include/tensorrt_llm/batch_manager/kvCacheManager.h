@@ -143,7 +143,7 @@ struct LinearAttentionMetadata
     WindowSizeType cacheType;
     SizeType32 allRecurrentStatesBytes; // Sum of all states like ssm_state and conv_state (1 layer)
     SizeType32 statesSnapshotInterval;  // Only used for kRecurrentStates
-    bool saveLastSnapshot;              // Take additional snapshot of recurrent states at the end of the input sequence
+    bool saveLastSnapshot;              // Take additional snapshot at the last context-storeable block boundary
 
     // Optional: explicit number of placeholder blocks for this kRecurrentStates manager.
     // If set, overrides the automatic computation (fullAttention.primaryBlocks - this.primaryBlocks).
@@ -164,28 +164,32 @@ struct LinearAttentionMetadata
     [[nodiscard]] bool shouldAllocateRecurrentStates(
         SizeType32 currentBlockEndTokenIdx, SizeType32 promptLen, SizeType32 tokensPerBlock) const
     {
-        // Allocate the last full block for maximum reuse opportunity.
-        if (saveLastSnapshot && (currentBlockEndTokenIdx / tokensPerBlock == promptLen / tokensPerBlock))
+        auto const currentBlockIdx = currentBlockEndTokenIdx / tokensPerBlock;
+        auto const blockEndTokenCount = currentBlockEndTokenIdx + 1;
+
+        // Allocate the last context-storeable block for maximum reuse opportunity.
+        // In WindowBlockManager::storeContextBlocks, only tokenNum - 1 will be stored,
+        // so the last block is never stored and the "last snapshot" is always the second to last block.
+        auto const lastSnapshotPosition = promptLen > 0 ? ((promptLen - 1) / tokensPerBlock) * tokensPerBlock : 0;
+        if (saveLastSnapshot && lastSnapshotPosition > 0 && blockEndTokenCount == lastSnapshotPosition)
         {
-            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: saveLastSnapshot",
-                (currentBlockEndTokenIdx / tokensPerBlock - 1));
+            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: saveLastSnapshot", currentBlockIdx);
             return true;
         }
 
         // Allocate the block that contains the end of the current sequence to save the final state.
-        if (currentBlockEndTokenIdx >= promptLen && currentBlockEndTokenIdx < promptLen + tokensPerBlock)
+        if (currentBlockEndTokenIdx >= promptLen - 1 && currentBlockEndTokenIdx < promptLen - 1 + tokensPerBlock)
         {
-            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: end of sequence",
-                (currentBlockEndTokenIdx / tokensPerBlock - 1));
+            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: end of sequence", currentBlockIdx);
             return true;
         }
 
         // We have checked statesSnapshotInterval is multiple of mTokensPerBlock during WindowBlockManager
         // initialization.
-        if ((statesSnapshotInterval > 0) && (currentBlockEndTokenIdx % statesSnapshotInterval == 0))
+        if ((statesSnapshotInterval > 0) && (blockEndTokenCount < promptLen)
+            && (blockEndTokenCount % statesSnapshotInterval == 0))
         {
-            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: statesSnapshotInterval",
-                (currentBlockEndTokenIdx / tokensPerBlock - 1));
+            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: statesSnapshotInterval", currentBlockIdx);
             return true;
         }
         return false;
@@ -199,26 +203,14 @@ struct LinearAttentionMetadata
             return 1;
         }
         SizeType32 count = 0;
-        if (statesSnapshotInterval > 0)
+        auto const numContextBlocks = (promptLen + tokensPerBlock - 1) / tokensPerBlock;
+        for (SizeType32 blockIdx = 0; blockIdx < numContextBlocks; ++blockIdx)
         {
-            count += promptLen / statesSnapshotInterval; // round down
-            // both enabled
-            if (saveLastSnapshot
-                && (promptLen / tokensPerBlock * tokensPerBlock
-                    != promptLen / statesSnapshotInterval * statesSnapshotInterval))
+            auto const blockEndTokenIdx = (blockIdx + 1) * tokensPerBlock - 1;
+            if (shouldAllocateRecurrentStates(blockEndTokenIdx, promptLen, tokensPerBlock))
             {
-                count += 1;
+                ++count;
             }
-        }
-        // only last snapshot enabled
-        else if (saveLastSnapshot)
-        {
-            count += 1;
-        }
-        if (promptLen % tokensPerBlock == 0)
-        {
-            // corner case
-            count += 1;
         }
         return count;
     }
@@ -1277,8 +1269,7 @@ private:
     //! \details A real recurrent-state block is stale once its block end is not later than
     //!          the request current position and a later real recurrent-state block exists
     //!          in the same beam.
-    void storeLinearAttentionCopySourcesAndReplaceWithPlaceholders(
-        GenerationRequest& sequence, LlmRequest const& llmRequest);
+    void releaseStaleLinearAttentionBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
     void addBlockToBeam(BlockPtr const& block, GenerationRequest& sequence, SizeType32 beamIdx);

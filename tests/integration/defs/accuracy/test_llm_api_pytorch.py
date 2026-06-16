@@ -45,8 +45,9 @@ from ..conftest import (check_device_contain, get_device_count,
                         skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
                         skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            JsonModeEval, LlmapiAccuracyTestHarness,
-                            LongBenchV1, LongBenchV2)
+                            GSM8KRepeatShuffleReuse, JsonModeEval,
+                            LlmapiAccuracyTestHarness, LongBenchV1, LongBenchV2,
+                            MMLURepeatShuffleReuse)
 
 
 # Keep helper definitions below imports so new imports do not need E402
@@ -5937,6 +5938,39 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper
+    def test_fp8_block_reuse_save_last_snapshot_repeat_shuffle(self):
+        model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
+        with LLM(
+                model_path,
+                trust_remote_code=True,
+                max_seq_len=4096,
+                max_batch_size=8,
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=True,
+                    mamba_ssm_cache_dtype="float16",
+                    mamba_state_cache_interval=0,
+                    mamba_save_last_snapshot=True,
+                    free_gpu_memory_fraction=0.8,
+                ),
+                cuda_graph_config=CudaGraphConfig(max_batch_size=8,
+                                                  enable_padding=True),
+                disable_overlap_scheduler=False,
+        ) as llm:
+            for task_cls in (MMLURepeatShuffleReuse, GSM8KRepeatShuffleReuse):
+                task = task_cls(self.MODEL_NAME)
+                extra_evaluator_kwargs = dict(
+                    apply_chat_template=True,
+                    chat_template_kwargs=dict(enable_thinking=False),
+                )
+                if task_cls is GSM8KRepeatShuffleReuse:
+                    extra_evaluator_kwargs["fewshot_as_multiturn"] = True
+                task.evaluate(
+                    llm,
+                    extra_evaluator_kwargs=extra_evaluator_kwargs,
+                    sampling_params=SamplingParams(max_tokens=8, temperature=0),
+                )
 
     @skip_pre_hopper
     def test_dflash(self):

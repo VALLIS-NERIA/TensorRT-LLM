@@ -1745,6 +1745,30 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
         result.claimedBlocks.push_back(std::move(claimed));
     }
 
+    while (!result.claimedBlocks.empty() && result.claimedBlocks.back().isPlaceholder)
+    {
+        auto placeholder = result.claimedBlocks.back().block;
+        TLLM_CHECK_WITH_INFO(placeholder != nullptr && placeholder->isPlaceholder(),
+            "%s::claimMatchingBlocks for request %lu - claimed tail block is marked placeholder but has block %d",
+            mLogPrefix.c_str(), sequence.getRequestId(),
+            placeholder == nullptr ? KVCacheBlock::kCachedBlocksRootId : placeholder->getBlockId());
+        tracker.map.erase(placeholder->getBlockId());
+        mEvictionPolicy->releaseBlock(placeholder, /*toFront=*/true);
+        result.claimedBlocks.pop_back();
+    }
+
+    result.latestMatchingNonPlaceholderBlockIdx = -1;
+    result.totalMatchedTokens = 0;
+    for (SizeType32 bi = 0; bi < static_cast<SizeType32>(result.claimedBlocks.size()); ++bi)
+    {
+        auto const& claimed = result.claimedBlocks[bi];
+        result.totalMatchedTokens += claimed.numMatchedTokens;
+        if (!claimed.isPlaceholder)
+        {
+            result.latestMatchingNonPlaceholderBlockIdx = bi;
+        }
+    }
+
     TLLM_LOG_DEBUG("%s::claimMatchingBlocks for request %lu - Claimed %zu blocks, %d matched tokens",
         mLogPrefix.c_str(), sequence.getRequestId(), result.claimedBlocks.size(), result.totalMatchedTokens);
 
@@ -1847,7 +1871,8 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
             if (isEnableBlockReuse)
             {
                 shouldAllocate = mLinearAttentionMetadata->shouldAllocateRecurrentStates(
-                    /*currentBlockEndTokenIdx=*/(bi + 1) * mTokensPerBlock, llmRequest.getPromptLen(), mTokensPerBlock);
+                    /*currentBlockEndTokenIdx=*/(bi + 1) * mTokensPerBlock - 1, llmRequest.getPromptLen(),
+                    mTokensPerBlock);
             }
             else
             {
@@ -2344,15 +2369,14 @@ bool WindowBlockManager::tryAllocatePlaceholderForLinearAttention(GenerationRequ
     return true;
 }
 
-void WindowBlockManager::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders(
-    GenerationRequest& sequence, LlmRequest const& request)
+void WindowBlockManager::releaseStaleLinearAttentionBlocks(GenerationRequest& sequence, LlmRequest const& request)
 {
     auto const requestId = sequence.getRequestId();
     auto seqIt = mAllocatedBlocksPerSeq.find(requestId);
     if (seqIt == mAllocatedBlocksPerSeq.end())
     {
-        TLLM_LOG_WARNING("%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - Request %lu not found",
-            mLogPrefix.c_str(), requestId);
+        TLLM_LOG_WARNING(
+            "%s::releaseStaleLinearAttentionBlocks - Request %lu not found", mLogPrefix.c_str(), requestId);
         return;
     }
 
@@ -2408,7 +2432,7 @@ void WindowBlockManager::storeLinearAttentionCopySourcesAndReplaceWithPlaceholde
             auto const sourceSlot = blockIdx * beamWidth + beamIdx;
             TLLM_CHECK_WITH_INFO(sourceSlot < static_cast<SizeType32>(allocatedBlocks.size())
                     && allocatedBlocks.at(sourceSlot)->getBlockId() == sourceBlock->getBlockId(),
-                "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - beam %d source slot has block %d, "
+                "%s::releaseStaleLinearAttentionBlocks - beam %d source slot has block %d, "
                 "expected %d",
                 mLogPrefix.c_str(), beamIdx,
                 sourceSlot < static_cast<SizeType32>(allocatedBlocks.size())
@@ -2423,7 +2447,7 @@ void WindowBlockManager::storeLinearAttentionCopySourcesAndReplaceWithPlaceholde
     for (auto const& [sourceBlockIdx, sourceBlockIdToBeamIdxs] : sourceBlockIdxToBlockIdToBeamIdxs)
     {
         TLLM_CHECK_WITH_INFO((sourceBlockIdx + 1) * beamWidth <= static_cast<SizeType32>(allocatedBlocks.size()),
-            "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - sourceBlockIdx %d out of range for "
+            "%s::releaseStaleLinearAttentionBlocks - sourceBlockIdx %d out of range for "
             "request %lu",
             mLogPrefix.c_str(), sourceBlockIdx, requestId);
 
@@ -2432,14 +2456,13 @@ void WindowBlockManager::storeLinearAttentionCopySourcesAndReplaceWithPlaceholde
             TLLM_CHECK(!beamIdxs.empty());
             auto sourceBlock = getBlockById(sourceBlockId);
             TLLM_CHECK_WITH_INFO(sourceBlock != nullptr && !sourceBlock->isPlaceholder(),
-                "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - invalid source block %d",
-                mLogPrefix.c_str(), sourceBlockId);
+                "%s::releaseStaleLinearAttentionBlocks - invalid source block %d", mLogPrefix.c_str(), sourceBlockId);
 
             auto const firstBeamIdx = beamIdxs.front();
             auto const& uniqueTokens = request.getUniqueTokens(firstBeamIdx);
             auto const sourceTokenCount = (sourceBlockIdx + 1) * mTokensPerBlock;
             TLLM_CHECK_WITH_INFO(sourceTokenCount <= static_cast<SizeType32>(uniqueTokens.size()),
-                "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - sourceTokenCount %d exceeds "
+                "%s::releaseStaleLinearAttentionBlocks - sourceTokenCount %d exceeds "
                 "unique token count %zu for request %lu",
                 mLogPrefix.c_str(), sourceTokenCount, uniqueTokens.size(), requestId);
 
@@ -2447,8 +2470,8 @@ void WindowBlockManager::storeLinearAttentionCopySourcesAndReplaceWithPlaceholde
                 uniqueTokens, sourceTokenCount, mTokensPerBlock, /*allowPartial=*/false);
             auto blockKeys = buildBlockKeys(blockedUniqueTokens, request);
             TLLM_CHECK_WITH_INFO(blockKeys.size() == static_cast<std::size_t>(sourceBlockIdx + 1),
-                "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - expected %d block keys, got %zu",
-                mLogPrefix.c_str(), sourceBlockIdx + 1, blockKeys.size());
+                "%s::releaseStaleLinearAttentionBlocks - expected %d block keys, got %zu", mLogPrefix.c_str(),
+                sourceBlockIdx + 1, blockKeys.size());
 
             std::vector<BlockPtr> beamBlocks;
             beamBlocks.reserve(sourceBlockIdx + 1);
@@ -2457,7 +2480,7 @@ void WindowBlockManager::storeLinearAttentionCopySourcesAndReplaceWithPlaceholde
                 beamBlocks.push_back(allocatedBlocks.at(blockIdx * beamWidth + firstBeamIdx));
             }
             TLLM_CHECK_WITH_INFO(beamBlocks.back()->getBlockId() == sourceBlockId,
-                "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - source slot has block %d, "
+                "%s::releaseStaleLinearAttentionBlocks - source slot has block %d, "
                 "expected %d",
                 mLogPrefix.c_str(), beamBlocks.back()->getBlockId(), sourceBlockId);
 
@@ -2468,7 +2491,7 @@ void WindowBlockManager::storeLinearAttentionCopySourcesAndReplaceWithPlaceholde
 
             auto storeResult = storeBlocks(blockKeys, beamBlocks, /*pinBlocks=*/false);
             TLLM_LOG_DEBUG(
-                "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - request %lu, source block %d at "
+                "%s::releaseStaleLinearAttentionBlocks - request %lu, source block %d at "
                 "index %d, stored %d blocks",
                 mLogPrefix.c_str(), requestId, sourceBlockId, sourceBlockIdx, storeResult.first);
 
@@ -2482,7 +2505,7 @@ void WindowBlockManager::storeLinearAttentionCopySourcesAndReplaceWithPlaceholde
             {
                 auto const sourceSlot = sourceBlockIdx * beamWidth + beamIdx;
                 TLLM_CHECK_WITH_INFO(allocatedBlocks.at(sourceSlot)->getBlockId() == sourceBlockId,
-                    "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - beam %d source slot has block "
+                    "%s::releaseStaleLinearAttentionBlocks - beam %d source slot has block "
                     "%d, expected %d",
                     mLogPrefix.c_str(), beamIdx, allocatedBlocks.at(sourceSlot)->getBlockId(), sourceBlockId);
 
@@ -2586,7 +2609,7 @@ bool WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
     // that this generation step may issue.
     if (request.isGenerationInProgressState() && mStoredLinearAttentionCopySourceReqIds.insert(requestId).second)
     {
-        storeLinearAttentionCopySourcesAndReplaceWithPlaceholders(sequence, request);
+        releaseStaleLinearAttentionBlocks(sequence, request);
     }
 
     // edge case: promptLen % tokensPerBlock == 0, and this is the first token of decoding phase
