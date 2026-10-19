@@ -113,7 +113,7 @@ def k3_fp8_kda_verify(
     [pool]. With ``g_ext`` (bf16 [T, H K], the unfused f_b output) the gate is read instead of computed from f_a."""
     import cuda.bindings.driver as cuda_driver
 
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_kda_verify import k3_kda_verify_kernel as kernel
+    from . import verify_kernel as kernel
 
     n_req = slots.shape[0]
     num_heads = w_fb.shape[0] // K
@@ -200,7 +200,7 @@ def k3_fp8_kda_verify(
             fn = _compiled.get(key)
             if fn is None:
                 fn = _compiled[key] = cute.compile(
-                    kernel.k3_kda_verify, *args, *runtime, num_heads, num_spec, float(lower_bound), float(scale),
+                    kernel.k3_fp8_kda_verify, *args, *runtime, num_heads, num_spec, float(lower_bound), float(scale),
                     float(eps), fold_fb, pdl, stream,
                 )  # fmt: skip
     fn(*args, *runtime, stream)
