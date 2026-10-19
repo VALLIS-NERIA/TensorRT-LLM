@@ -55,6 +55,7 @@ from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.quantization.utils.fp8_utils import resmooth_to_fp8_e8m0
 
 from . import attention as _fp8_attention
 from . import decode_comm as _decode_comm
@@ -161,6 +162,7 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.models.modeling_dspark.draft_is_embedded_in_target",
     "tensorrt_llm._torch.models.modeling_dflash.DFlashForCausalLM",
     "tensorrt_llm._torch.pyexecutor.config_utils.is_mla",
+    "tensorrt_llm.quantization.utils.fp8_utils.resmooth_to_fp8_e8m0",
 )
 
 # The K3 decode kernels' bounds: the token-count kernels take one tile of DECODE_MAX_TOKENS rows; the request-aware
@@ -2275,10 +2277,12 @@ class K3DecodeKDA(KimiKDALinearAttention):
         return self._store_core(core, output)
 
     def _k3_verify(self, x, num_steps, layer_cache, ssm_pool, slot_indices) -> torch.Tensor:
-        """The core output ``[N T, H, 128]`` of N requests of T verify tokens: ``ssm/k3_kda_attn`` for one request of
-        8 tokens, else ``ssm/k3_kda_verify`` on the projection's rows (the ``kda_proj`` decode GEMV site where it
-        takes them). Each slot's state after the golden token, its drafts' states and its conv window are written in
-        place."""
+        """Verify N requests of T tokens from FP8 QKVG and BF16 gate projections.
+
+        Return ``[N T, H, 128]`` and update each slot's committed state, FP32
+        draft records and convolution window. The recurrence uses FP32 with
+        either FP32 or BF16 committed-state storage.
+        """
         num_requests = x.shape[0] // num_steps
         slots = slot_indices[:num_requests]
         w_q, w_k, w_v = self._get_mtp_conv_weights()
@@ -2314,10 +2318,11 @@ class K3DecodeMLA(KimiK3MLAAttention):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._fp8_qb_weight = self._fp8_qb_scale = None
+        self._fp8_qb_ue8m0 = False
         self._fp8_decode_ready = False
 
     def prepare_fp8_decode_weights(self) -> None:
-        """Retain checkpoint Q-B codes before the GEMM backend transforms them."""
+        """Prepare FP8 Q-B codes and scales with the selected GEMM's quantization recipe."""
         linear = self.q_b_proj
         if linear.weight.dtype != torch.float8_e4m3fn:
             raise ValueError("NVFP4 fused MLA requires checkpoint FP8 Q-B projections")
@@ -2329,6 +2334,12 @@ class K3DecodeMLA(KimiK3MLAAttention):
             )
         self._fp8_qb_weight = linear.weight.detach().clone().contiguous()
         self._fp8_qb_scale = scale.detach().clone().contiguous()
+        self._fp8_qb_ue8m0 = not (
+            getattr(linear, "use_cute_dsl_blockscaling_mm", False)
+            or getattr(linear, "disable_deep_gemm", False)
+        ) or (linear.weight.is_cuda and torch.cuda.get_device_capability() == (10, 7))
+        if self._fp8_qb_ue8m0:
+            resmooth_to_fp8_e8m0(self._fp8_qb_weight, self._fp8_qb_scale)
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
@@ -2413,6 +2424,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
             view["tokens_per_request"],
             float(self.q_a_layernorm.variance_epsilon),
             float(self.kv_a_layernorm.variance_epsilon),
+            self._fp8_qb_ue8m0,
         )
         core = _fp8_attention.mla_attn(
             fused_q,
@@ -2449,6 +2461,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
             self.kv_a_layernorm.weight,
             float(self.q_a_layernorm.variance_epsilon),
             float(self.kv_a_layernorm.variance_epsilon),
+            self._fp8_qb_ue8m0,
         )
         q_pe = query.view(-1, self.num_heads_tp, 576)[..., 512:]
         cu_q = torch.empty(metadata.num_seqs + 1, dtype=torch.int32, device=ag.device)

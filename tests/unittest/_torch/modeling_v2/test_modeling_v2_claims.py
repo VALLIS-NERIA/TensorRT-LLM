@@ -166,6 +166,7 @@ def test_targets_only_import_their_declared_family_implementation():
 _NON_COMPUTE_IMPORTS = frozenset(
     {
         "AllReduceStrategy",
+        "AttentionInputType",
         "AttentionMetadata",
         "AuxStreamType",
         "MambaHybridCacheManagerV2",

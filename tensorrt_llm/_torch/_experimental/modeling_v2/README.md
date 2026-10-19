@@ -23,10 +23,20 @@ V2 cache manager; its high-precision tail and packed scales retain the native
 layout. The KDA fused decode and verify accept FP32 or BF16 recurrent-state
 storage, with FP32 recurrence arithmetic and FP32 per-token draft records.
 These KV and SSM storage choices are independent of the NVFP4 expert weights.
+The fused Q-B projection follows the selected GEMM backend's FP8 recipe,
+including weight resmoothing and UE8M0 activation scales where required.
+
+| MLA KV storage | KDA SSM storage | KDA recurrence / draft records |
+|---|---|---|
+| BF16 | FP32 or BF16 | FP32 |
+| FP8 E4M3 | FP32 or BF16 | FP32 |
+| NVFP4 | FP32 or BF16 | FP32 |
+
 For NVFP4 KV and BF16 recurrent-state storage:
 
 ```yaml
 modeling_v2: require
+enable_chunked_prefill: false
 kv_cache_config:
   dtype: nvfp4
   tokens_per_block: 128

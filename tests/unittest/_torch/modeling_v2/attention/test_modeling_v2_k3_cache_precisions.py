@@ -22,6 +22,7 @@ from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm._torch.utils import model_extra_attrs
@@ -36,12 +37,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("cache_dtype", ["bf16", "fp8", "nvfp4"])
+@pytest.mark.parametrize(
+    "cache_dtype", ["bf16", "fp8", "nvfp4", "nvfp4_ssm_fp32", "nvfp4_ssm_bf16"]
+)
 @pytest.mark.parametrize("batch,tokens", [(1, 1), (2, 1), (4, 1), (1, 4), (2, 4), (4, 4)])
-@torch.inference_mode()
+@torch.no_grad()
 def test_fp8_mla_cache_precisions(monkeypatch, cache_dtype: str, batch: int, tokens: int) -> None:
     import tensorrt_llm._torch.modules.kimi_k3_mla as mla_package
 
+    hybrid = cache_dtype.startswith("nvfp4_ssm_")
+    state_dtype = torch.bfloat16 if cache_dtype.endswith("bf16") else torch.float32
+    if hybrid:
+        cache_dtype = "nvfp4"
     torch.manual_seed(451)
     monkeypatch.setattr(mla_package, "KimiK3MLAAttention", K3DecodeMLA)
     config = KimiLinearConfig(
@@ -96,22 +103,37 @@ def test_fp8_mla_cache_precisions(monkeypatch, cache_dtype: str, batch: int, tok
     )
     load_mla_checkpoint(model, projections, "")
     runtime = model.model.layers[0].self_attn.mixer
-    runtime._fp8_qb_weight = weights["q_b_proj"]["weight"].cuda().contiguous()
-    runtime._fp8_qb_scale = weights["q_b_proj"]["weight_scale"].cuda().contiguous()
+    runtime.prepare_fp8_decode_weights()
     for module in runtime.modules():
         if callable(getattr(module, "post_load_weights", None)):
             module.post_load_weights()
     context_length = 128
     page_size = 128 if cache_dtype == "nvfp4" else 64
     manager_class = Fp4MlaKVCacheManagerV2 if cache_dtype == "nvfp4" else KVCacheManagerV2
+    manager_kwargs = {}
+    if hybrid:
+        manager_class = MambaHybridCacheManagerV2
+        manager_kwargs = dict(
+            mamba_d_state=128,
+            mamba_d_conv=4,
+            mamba_num_heads=6,
+            mamba_n_groups=6,
+            mamba_head_dim=128,
+            mamba_num_layers=1,
+            mamba_layer_mask=[False, True],
+            mamba_cache_dtype=torch.bfloat16,
+            mamba_ssm_cache_dtype=state_dtype,
+            layer_mask=[True, False],
+            conv_state_layout="q_k_v",
+        )
     manager = manager_class(
-        KvCacheConfig(
+        kv_cache_config=KvCacheConfig(
             max_tokens=256 * batch,
             dtype="auto" if cache_dtype == "bf16" else cache_dtype,
             enable_block_reuse=False,
             host_cache_size=0,
         ),
-        CacheTypeCpp.SELFKONLY,
+        kv_cache_type=CacheTypeCpp.SELFKONLY,
         num_layers=1,
         num_kv_heads=1,
         head_dim=576,
@@ -123,10 +145,15 @@ def test_fp8_mla_cache_precisions(monkeypatch, cache_dtype: str, batch: int, tok
         max_num_tokens=batch * context_length,
         pretrained_config=config,
         spec_config=MTPDecodingConfig(max_draft_len=tokens - 1) if tokens > 1 else None,
+        **manager_kwargs,
     )
     try:
         requests = manager.add_dummy_requests(list(range(batch)), [context_length + tokens] * batch)
         assert requests is not None
+        if hybrid:
+            assert manager.get_ssm_states(1).dtype == state_dtype
+            assert manager.get_buffers(1) is None
+            assert manager.get_fp4_mla_page_table_spec(0).hp_is_paged
         for request in requests:
             request.state = LlmRequestState.GENERATION_IN_PROGRESS
             request.prompt_len = context_length

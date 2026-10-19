@@ -176,6 +176,7 @@ def _mla_qkv(
     QA_EPS: tl.constexpr,
     KV_EPS: tl.constexpr,
     STORE_PAGED: tl.constexpr = True,
+    QB_UE8M0: tl.constexpr = False,
 ):
     head, chunk = tl.program_id(0), tl.program_id(1)
     rows = chunk * 16 + tl.arange(0, 16)
@@ -198,6 +199,8 @@ def _mla_qkv(
         a *= rms[:, None] * tl.load(QA_NORM + cols)[None, :].to(tl.float32)
         a = a.to(tl.bfloat16).to(tl.float32)
         a_scale = tl.maximum(tl.max(tl.abs(a), 1) / 448.0, 1.0e-12)
+        if QB_UE8M0:
+            a_scale = tl.exp2(tl.ceil(tl.log2(a_scale)))
         a8 = (a / a_scale[:, None]).to(tl.float8e4nv)
         b = tl.load(QB + qb_rows[None, :] * 1536 + cols[:, None], n[None, :] < 192, 0.0)
         bs = tl.load(QB_SCALE + (qb_rows // 128) * QB_SCALE_STRIDE + block, n < 192, 0)
@@ -262,6 +265,7 @@ def mla_qkv(
     tokens_per_request: int,
     qa_eps: float,
     kv_eps: float,
+    qb_ue8m0: bool = False,
 ) -> torch.Tensor:
     """Fuse Q-A norm, FP8 Q-B/absorption and the paged latent-cache update."""
     h = kb.shape[0]
@@ -290,6 +294,7 @@ def mla_qkv(
         tokens_per_request,
         qa_eps,
         kv_eps,
+        QB_UE8M0=qb_ue8m0,
         num_warps=8,
     )
     return out
@@ -312,6 +317,7 @@ def _qkv_fake(
     tokens_per_request,
     qa_eps,
     kv_eps,
+    qb_ue8m0=False,
 ):
     return ag.new_empty((ag.shape[0], kb.shape[0] * 576))
 
@@ -327,6 +333,7 @@ def mla_project_qkv(
     kv_norm: torch.Tensor,
     qa_eps: float,
     kv_eps: float,
+    qb_ue8m0: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce absorbed Q and normalized latent KV for quantized cache kernels."""
     h = kb.shape[0]
@@ -357,13 +364,16 @@ def mla_project_qkv(
         qa_eps,
         kv_eps,
         STORE_PAGED=False,
+        QB_UE8M0=qb_ue8m0,
         num_warps=8,
     )
     return query, latent
 
 
 @mla_project_qkv.register_fake
-def _project_qkv_fake(ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, qa_eps, kv_eps):
+def _project_qkv_fake(
+    ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, qa_eps, kv_eps, qb_ue8m0=False
+):
     return ag.new_empty((ag.shape[0], kb.shape[0] * 576)), ag.new_empty((ag.shape[0], 576))
 
 

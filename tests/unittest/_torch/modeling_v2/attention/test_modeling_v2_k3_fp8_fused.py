@@ -33,9 +33,11 @@ def _rand(*shape, scale=1.0):
     return (torch.randn(shape, device="cuda") * scale).bfloat16()
 
 
-def _quantize(x):
+def _quantize(x, ue8m0=False):
     groups = x.float().unflatten(-1, (-1, 128))
     scale = groups.abs().amax(-1, keepdim=True).clamp_min(4.48e-10) / 448
+    if ue8m0:
+        scale = torch.exp2(torch.ceil(torch.log2(scale)))
     codes = (groups / scale).to(torch.float8_e4m3fn)
     return (codes.float() * scale).flatten(-2)
 
@@ -122,7 +124,8 @@ def test_fp8_kda_fused_decode(batch, state_dtype):
 
 
 @pytest.mark.parametrize("batch,tokens", [(1, 1), (2, 1), (4, 1), (1, 4), (4, 8)])
-def test_fp8_mla_fused_query_cache_and_attention(batch, tokens):
+@pytest.mark.parametrize("qb_ue8m0", [False, True])
+def test_fp8_mla_fused_query_cache_and_attention(batch, tokens, qb_ue8m0):
     torch.manual_seed(422)
     torch.backends.cuda.matmul.allow_tf32 = False
     h, m = 6, batch * tokens
@@ -130,6 +133,8 @@ def test_fp8_mla_fused_query_cache_and_attention(batch, tokens):
     qa_norm, kv_norm = _rand(1536, scale=0.2), _rand(512, scale=0.2)
     qb = _rand(h * 192, 1536, scale=0.05).to(torch.float8_e4m3fn)
     qb_scale = torch.rand(9, 12, device="cuda") * 0.2 + 0.1
+    if qb_ue8m0:
+        qb_scale = torch.exp2(torch.ceil(torch.log2(qb_scale)))
     kb = _rand(h, 512, 128, scale=0.05).to(torch.float8_e4m3fn)
     kb_scale = torch.rand(h, 4, 1, device="cuda") * 0.2 + 0.1
     vb = _rand(h, 128, 512, scale=0.05).to(torch.float8_e4m3fn)
@@ -152,7 +157,7 @@ def test_fp8_mla_fused_query_cache_and_attention(batch, tokens):
         qa * torch.rsqrt(qa.square().mean(-1, keepdim=True) + 1.0e-6) * qa_norm.float()
     ).bfloat16()
     qb_dequant = qb.float() * qb_scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
-    q = (_quantize(qa) @ qb_dequant.T).bfloat16().view(m, h, 192)
+    q = (_quantize(qa, qb_ue8m0) @ qb_dequant.T).bfloat16().view(m, h, 192)
     kb_dequant = kb.float() * kb_scale.repeat_interleave(128, 1).repeat_interleave(128, 2)
     absorbed = torch.einsum("mhk,hvk->mhv", _quantize(q[..., :128]), kb_dequant).bfloat16()
     expected_q = torch.cat((absorbed, q[..., 128:]), -1).flatten(1)
@@ -179,11 +184,12 @@ def test_fp8_mla_fused_query_cache_and_attention(batch, tokens):
         tokens,
         1.0e-6,
         1.0e-6,
+        qb_ue8m0,
     )
     torch.testing.assert_close(actual_q, expected_q, atol=0.002, rtol=0.02)
     torch.testing.assert_close(pool, expected_pool, atol=0.002, rtol=0.02)
     projected_q, latent_cache = _ops().mla_project_qkv(
-        ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, 1.0e-6, 1.0e-6
+        ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, 1.0e-6, 1.0e-6, qb_ue8m0
     )
     torch.testing.assert_close(projected_q, actual_q, atol=0, rtol=0)
     latent = ag[:, 1536:2048].float()
@@ -230,7 +236,7 @@ def test_fp8_mla_fused_query_cache_and_attention(batch, tokens):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         graph_projected_q, graph_latent = _ops().mla_project_qkv(
-            ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, 1.0e-6, 1.0e-6
+            ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, 1.0e-6, 1.0e-6, qb_ue8m0
         )
         graph_projected_output = _ops().mla_output(latent_output, vb, vb_scale, ag, 2112)
         graph_q = _ops().mla_qkv(
@@ -249,6 +255,7 @@ def test_fp8_mla_fused_query_cache_and_attention(batch, tokens):
             tokens,
             1.0e-6,
             1.0e-6,
+            qb_ue8m0,
         )
         graph_output = _ops().mla_attn(
             graph_q,
@@ -288,6 +295,7 @@ def test_fp8_mla_fused_query_cache_and_attention(batch, tokens):
         tokens,
         1.0e-6,
         1.0e-6,
+        qb_ue8m0,
     )
     updated_output = _ops().mla_attn(
         updated_q,

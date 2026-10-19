@@ -16,6 +16,80 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 pytestmark = pytest.mark.cpu_only
 
 
+def test_nvfp4_k3_selects_hybrid_v2_cache_manager(monkeypatch):
+    from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.pyexecutor._util import (
+        _create_kv_cache_manager,
+        get_kv_cache_manager_cls,
+    )
+    from tensorrt_llm._torch.pyexecutor.config_utils import uses_fp4_mla_attention
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        MambaHybridCacheManagerV2,
+    )
+    from tensorrt_llm._torch.pyexecutor.model_loader import validate_fp4_mla_config
+    from tensorrt_llm.llmapi import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    config = ModelConfig(
+        pretrained_config=KimiLinearConfig(
+            num_hidden_layers=2,
+            linear_attn_config={
+                "kda_layers": [1],
+                "full_attn_layers": [2],
+                "head_dim": 128,
+                "num_heads": 6,
+                "short_conv_kernel_size": 4,
+            },
+            q_lora_rank=1536,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+        ),
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4),
+    )
+    cache = KvCacheConfig(dtype="nvfp4", use_kv_cache_manager_v2=True)
+    assert uses_fp4_mla_attention(config)
+    validate_fp4_mla_config(
+        config, SimpleNamespace(kv_cache_config=cache, enable_chunked_prefill=False)
+    )
+    assert get_kv_cache_manager_cls(config, cache) is MambaHybridCacheManagerV2
+    captured = {}
+
+    class RecordingManager(MambaHybridCacheManagerV2):
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=RecordingManager,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        kv_cache_config=cache,
+        tokens_per_block=128,
+        max_seq_len=256,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=256,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=config,
+        dtype=torch.bfloat16,
+    )
+    assert captured["pretrained_config"] is config.pretrained_config
+    with pytest.raises(ValueError, match="use_kv_cache_manager_v2"):
+        get_kv_cache_manager_cls(
+            config, cache.model_copy(update={"use_kv_cache_manager_v2": False})
+        )
+    monkeypatch.setenv("TRTLLM_USE_PY_MAMBA", "1")
+    with pytest.raises(ValueError, match="MambaHybridCacheManagerV2"):
+        get_kv_cache_manager_cls(config, cache)
+
+
 @pytest.mark.parametrize("moe_tp,moe_ep", [(4, 4), (16, 1)])
 def test_sm100_mxfp4_keeps_its_own_model(moe_tp: int, moe_ep: int) -> None:
     module = importlib.import_module(
@@ -37,6 +111,8 @@ def test_fp8_mla_preserves_raw_query_weights_before_backend_transformation() -> 
         weight_scale=scales,
         out_features=128,
         in_features=128,
+        use_cute_dsl_blockscaling_mm=True,
+        disable_deep_gemm=False,
     )
     attention.prepare_fp8_decode_weights()
     codes.zero_()
@@ -44,6 +120,33 @@ def test_fp8_mla_preserves_raw_query_weights_before_backend_transformation() -> 
     assert attention._fp8_qb_weight.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(attention._fp8_qb_weight.float(), torch.ones(128, 128))
     torch.testing.assert_close(attention._fp8_qb_scale, torch.full((1, 1), 0.125))
+
+
+@pytest.mark.parametrize(
+    "backend,ue8m0",
+    [
+        ({}, True),
+        ({"use_cute_dsl_blockscaling_mm": False, "disable_deep_gemm": False}, True),
+        ({"use_cute_dsl_blockscaling_mm": True, "disable_deep_gemm": False}, False),
+        ({"use_cute_dsl_blockscaling_mm": False, "disable_deep_gemm": True}, False),
+    ],
+)
+def test_fp8_mla_query_recipe_handles_weight_read_specialization(monkeypatch, backend, ue8m0):
+    attention = modeling.K3DecodeMLA.__new__(modeling.K3DecodeMLA)
+    torch.nn.Module.__init__(attention)
+    codes = torch.ones(128, 128).to(torch.float8_e4m3fn)
+    scales = torch.full((1, 1), 0.125)
+    attention.q_b_proj = SimpleNamespace(
+        weight=codes, weight_scale=scales, out_features=128, in_features=128, **backend
+    )
+    calls = []
+    monkeypatch.setattr(modeling, "resmooth_to_fp8_e8m0", lambda w, s: calls.append((w, s)))
+    attention.prepare_fp8_decode_weights()
+    assert attention._fp8_qb_ue8m0 == ue8m0
+    assert len(calls) == int(ue8m0)
+    if calls:
+        assert calls[0][0].data_ptr() != codes.data_ptr()
+        assert calls[0][1].data_ptr() != scales.data_ptr()
 
 
 @pytest.mark.parametrize("sm", [(10, 3), (10, 7)])
