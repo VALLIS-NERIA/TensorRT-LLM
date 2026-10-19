@@ -81,7 +81,7 @@ def test_fp8_mla_cache_precisions(monkeypatch, cache_dtype: str, batch: int, tok
             )
             for name in weights
         },
-        use_cute_dsl_blockscaling_mm=True,
+        use_cute_dsl_blockscaling_mm=torch.cuda.get_device_capability() == (10, 7),
         use_cute_dsl_blockscaling_bmm=True,
     )
     with torch.device("cuda"):

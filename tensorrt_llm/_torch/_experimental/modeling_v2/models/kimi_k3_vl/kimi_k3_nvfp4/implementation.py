@@ -16,7 +16,6 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_drafter_attn_qknorm import (
     k3_drafter_attn_qknorm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_verify import k3_kda_verify
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 
@@ -63,6 +62,7 @@ from . import decode_gemv as _decode_gemv
 from . import decode_moe as _decode_moe
 from . import spec_worker as _spec_worker
 from . import weights as _weights
+from .verify import k3_fp8_kda_verify
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -84,7 +84,7 @@ REQUIRED_TRTLLM_OPS = (
     "kda_mtp_decode",
     "dsv3_router_gemm_op",
     "dsv3_fused_a_gemm_op",
-    "k3_kda_verify",
+    "k3_fp8_kda_verify",
     "k3_fp8_kda_decode",
     "k3_fp8_mla_qkv",
     "k3_fp8_mla_attn",
@@ -2286,7 +2286,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
         rows = torch.cat(
             (self.qkvg_proj(x), torch.nn.functional.linear(x, self._bfa_proj_weight)), dim=-1
         )
-        out = k3_kda_verify(
+        out = k3_fp8_kda_verify(
             rows,
             self.f_b_proj.weight,
             w_q,

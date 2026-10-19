@@ -6,7 +6,9 @@ import _kda_cells as kc
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_verify import k3_kda_verify
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4.verify import (
+    k3_fp8_kda_verify,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -16,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _run(weights: dict, pools: dict, projection: torch.Tensor, slots: torch.Tensor, drafts: int):
-    return k3_kda_verify(
+    return k3_fp8_kda_verify(
         projection,
         weights["w_fb"],
         weights["w_q"],
