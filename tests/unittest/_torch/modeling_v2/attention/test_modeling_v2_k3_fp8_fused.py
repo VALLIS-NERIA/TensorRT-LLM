@@ -182,6 +182,16 @@ def test_fp8_mla_fused_query_cache_and_attention(batch, tokens):
     )
     torch.testing.assert_close(actual_q, expected_q, atol=0.002, rtol=0.02)
     torch.testing.assert_close(pool, expected_pool, atol=0.002, rtol=0.02)
+    projected_q, latent_cache = _ops().mla_project_qkv(
+        ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, 1.0e-6, 1.0e-6
+    )
+    torch.testing.assert_close(projected_q, actual_q, atol=0, rtol=0)
+    latent = ag[:, 1536:2048].float()
+    latent = (
+        latent * torch.rsqrt(latent.square().mean(-1, keepdim=True) + 1.0e-6) * kv_norm.float()
+    ).bfloat16()
+    torch.testing.assert_close(latent_cache[:, :512], latent, atol=0.002, rtol=0.02)
+    torch.testing.assert_close(latent_cache[:, 512:], ag[:, 2048:2112], atol=0, rtol=0)
     vb_dequant = vb.float() * vb_scale.repeat_interleave(128, 1).repeat_interleave(128, 2)
     expected_output = []
     for row in range(m):
@@ -209,8 +219,20 @@ def test_fp8_mla_fused_query_cache_and_attention(batch, tokens):
         2112,
     )
     torch.testing.assert_close(actual, torch.stack(expected_output), atol=0.002, rtol=0.02)
+    latent_output = _rand(m, h * 512, scale=0.1)
+    projected = torch.einsum(
+        "mhk,hvk->mhv", _quantize(latent_output.view(m, h, 512)), vb_dequant
+    ).bfloat16()
+    expected = (projected.flatten(1).float() * ag[:, 2112:].float().sigmoid()).bfloat16()
+    torch.testing.assert_close(
+        _ops().mla_output(latent_output, vb, vb_scale, ag, 2112), expected, atol=0.002, rtol=0.02
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        graph_projected_q, graph_latent = _ops().mla_project_qkv(
+            ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, 1.0e-6, 1.0e-6
+        )
+        graph_projected_output = _ops().mla_output(latent_output, vb, vb_scale, ag, 2112)
         graph_q = _ops().mla_qkv(
             ag,
             qa_norm,
@@ -245,6 +267,9 @@ def test_fp8_mla_fused_query_cache_and_attention(batch, tokens):
     graph.replay()
     torch.testing.assert_close(graph_q, actual_q, atol=0, rtol=0)
     torch.testing.assert_close(graph_output, actual, atol=0, rtol=0)
+    torch.testing.assert_close(graph_projected_q, actual_q, atol=0, rtol=0)
+    torch.testing.assert_close(graph_latent, latent_cache, atol=0, rtol=0)
+    torch.testing.assert_close(graph_projected_output, expected, atol=0.002, rtol=0.02)
     lengths.add_(1)
     graph.replay()
     updated_q = _ops().mla_qkv(

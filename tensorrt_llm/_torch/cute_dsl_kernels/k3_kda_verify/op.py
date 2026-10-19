@@ -108,7 +108,7 @@ def k3_kda_verify(
     ``proj`` bf16 [T, 4 H K + K + H + pad]: the fused projection rows [q | k | v | onorm gate | f_a | b | pad];
     ``w_fb`` bf16 [H K, K], the f_b weight (out, in); ``w_q/w_k/w_v`` fp32 [H K, 4]; ``a_log`` fp32 [H];
     ``dt_bias`` fp32 [H K]; ``onorm_w`` fp32 [V]; ``cs_*`` fp32 [pool, H K, 3 + num_spec] (dim-contiguous);
-    ``ssm`` fp32 [pool, H, V, K] (each slot dense, slots at any stride); ``state_tok`` fp32
+    ``ssm`` fp32 or bf16 [pool, H, V, K] (each slot dense, slots at any stride); ``state_tok`` fp32
     [pool, 3, num_spec, H, K], the drafts' records (vn, beta * k, decay); ``slots`` int32 [N]; ``pending`` int32
     [pool]. With ``g_ext`` (bf16 [T, H K], the unfused f_b output) the gate is read instead of computed from f_a."""
     import cuda.bindings.driver as cuda_driver
@@ -133,7 +133,7 @@ def k3_kda_verify(
         or tuple(ssm.shape[1:]) != (num_heads, K, K)
         or tuple(state_tok.shape[1:]) != (3, num_spec, num_heads, K)
         or ssm.stride()[1:] != (K * K, K, 1)
-        or ssm.dtype != torch.float32
+        or ssm.dtype not in (torch.float32, torch.bfloat16)
         or not state_tok.is_contiguous()
         or state_tok.dtype != torch.float32
         or cs_q.shape[-1] != CONV_W - 1 + num_spec
@@ -177,7 +177,16 @@ def k3_kda_verify(
     runtime = (proj.shape[1] // 2, n_req, ssm.stride(0))
     stream = cuda_driver.CUstream(torch.cuda.current_stream(proj.device).cuda_stream)
     pdl = use_pdl()
-    key = (num_heads, num_spec, float(lower_bound), float(scale), float(eps), fold_fb, pdl)
+    key = (
+        num_heads,
+        num_spec,
+        ssm.dtype,
+        float(lower_bound),
+        float(scale),
+        float(eps),
+        fold_fb,
+        pdl,
+    )
     fn = _compiled.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():

@@ -16,9 +16,24 @@ shared by thin SM103 and SM107 target classes. NVFP4 retains checkpoint FP8
 projection weights and activations: decode fuses KDA's gate, convolution,
 recurrence and output normalization, and MLA's query/absorption/cache writes
 and attention/V-B/output gate. The ordinary FP8 GEMMs remain responsible for
-input and output projections. MLA's fused decode currently reads a BF16 KV
-cache with 64-token pages; other layouts use the native path. The KDA fused
-verify path retains FP32 states and the original per-token draft records.
+input and output projections. MLA's fused decode uses a BF16 KV cache with
+64-token pages, or composes the fused FP8 projections with the native FP8
+and NVFP4 cache/attention kernels. NVFP4 KV requires 128-token pages and the
+V2 cache manager; its high-precision tail and packed scales retain the native
+layout. The KDA fused decode and verify accept FP32 or BF16 recurrent-state
+storage, with FP32 recurrence arithmetic and FP32 per-token draft records.
+These KV and SSM storage choices are independent of the NVFP4 expert weights.
+For NVFP4 KV and BF16 recurrent-state storage:
+
+```yaml
+modeling_v2: require
+kv_cache_config:
+  dtype: nvfp4
+  tokens_per_block: 128
+  mamba_ssm_cache_dtype: bfloat16
+  use_kv_cache_manager_v2: true
+```
+
 The NVFP4 expert kernels remain separate from the MXFP4/MXFP8 kernels.
 Every hardware and quantization target requires its own accuracy gates.
 

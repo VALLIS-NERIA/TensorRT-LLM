@@ -46,6 +46,24 @@ def test_fp8_mla_preserves_raw_query_weights_before_backend_transformation() -> 
     torch.testing.assert_close(attention._fp8_qb_scale, torch.full((1, 1), 0.125))
 
 
+@pytest.mark.parametrize("sm", [(10, 3), (10, 7)])
+def test_nvfp4_kda_selects_rubin_projection_backend(monkeypatch, sm) -> None:
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    captured = []
+
+    def initialize(module, *args, model_config, **kwargs):
+        torch.nn.Module.__init__(module)
+        captured.append(model_config)
+
+    monkeypatch.setattr(modeling.KimiKDALinearAttention, "__init__", initialize)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: sm)
+    config = ModelConfig(use_cute_dsl_blockscaling_mm=False)
+    modeling.K3DecodeKDA(model_config=config)
+    assert captured[0].use_cute_dsl_blockscaling_mm == (sm == (10, 7))
+    assert not config.use_cute_dsl_blockscaling_mm
+
+
 @pytest.mark.parametrize(
     "sm,fmt,moe_tp,moe_ep",
     [

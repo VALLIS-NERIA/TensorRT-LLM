@@ -18,6 +18,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_drafter_
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_verify import k3_kda_verify
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 
 # Registers trtllm::kda_mtp_decode (REQUIRED_TRTLLM_OPS), which the built-in KDA module loads on its first verify.
 from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_kda_mtp_ops  # noqa: F401
@@ -87,6 +88,8 @@ REQUIRED_TRTLLM_OPS = (
     "k3_fp8_kda_decode",
     "k3_fp8_mla_qkv",
     "k3_fp8_mla_attn",
+    "k3_fp8_mla_project_qkv",
+    "k3_fp8_mla_output",
     # The decode path's GEMVs, the dense MLP's activation, the LM head and the embedding (decode_gemv.py).
     "k3_decode_gemv",
     "k3_ctm_gemv_wide",
@@ -1312,6 +1315,8 @@ class KimiMLARuntime(nn.Module):
             )
         }
         attention_config.use_cute_dsl_blockscaling_bmm = True
+        if torch.cuda.get_device_capability() == (10, 7):
+            attention_config.use_cute_dsl_blockscaling_mm = True
         attention_config.quant_config = QuantConfig(
             kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
             if model_config.quant_config is not None
@@ -2123,6 +2128,13 @@ class K3DecodeKDA(KimiKDALinearAttention):
     """
 
     def __init__(self, *args, **kwargs) -> None:
+        config = kwargs.get("model_config")
+        if config is not None and torch.cuda.get_device_capability() == (10, 7):
+            config = copy.copy(config)
+            config._frozen = False
+            config.use_cute_dsl_blockscaling_mm = True
+            config._frozen = kwargs["model_config"]._frozen
+            kwargs["model_config"] = config
         super().__init__(*args, **kwargs)
         self.fp8_decode_ready = False
         self.decode_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
@@ -2259,8 +2271,6 @@ class K3DecodeKDA(KimiKDALinearAttention):
             f"Kimi K3 KDA layer {self.layer_idx}: the cache manager keeps the per-token verify states, which only "
             "the decode kernels write, and this layer has no fused projection weight or buffers"
         )
-        if ssm_pool.dtype != torch.float32:
-            raise ValueError("Fused KDA verification requires an FP32 recurrent-state pool")
         core = self._k3_verify(x2d, num_steps, layer_cache, ssm_pool, slot_indices)
         return self._store_core(core, output)
 
@@ -2347,6 +2357,22 @@ class K3DecodeMLA(KimiK3MLAAttention):
             != (1536, 512, 128, 64, 128)
         ):
             return None
+        quantized_cache = bool(
+            getattr(self.mqa, "has_fp4_kv_cache", False)
+            or getattr(self.mqa, "has_fp8_kv_cache", False)
+        )
+        if quantized_cache:
+            if (
+                metadata.num_contexts != 0
+                or not 0 < metadata.num_generations <= 8
+                or not 0 < step.tokens_per_request <= 8
+                or step.num_tokens != metadata.num_generations * step.tokens_per_request
+                or metadata.beam_width != 1
+                or getattr(metadata, "is_spec_dec_tree", False)
+                or getattr(metadata, "is_spec_dec_dynamic_tree", False)
+            ):
+                return None
+            return {"quantized_cache": True}
         view = k3_mla_decode_view(self.mqa, metadata, step.num_tokens)
         return None if isinstance(view, str) else view
 
@@ -2365,6 +2391,11 @@ class K3DecodeMLA(KimiK3MLAAttention):
             return self.forward_generic(position_ids, hidden_states, attn_metadata)
         x = hidden_states[: step.num_tokens]
         ag = torch.cat((self.kv_a_proj_with_mqa(x), self.g_proj(x)), dim=-1)
+        if view.get("quantized_cache", False):
+            core = self._quantized_decode(ag, position_ids, attn_metadata)
+            if not project_output:
+                return core
+            return self._project_output([core], position_ids, attn_metadata, None)
         fused_q = _fp8_attention.mla_qkv(
             ag,
             self.q_a_layernorm.weight,
@@ -2399,6 +2430,70 @@ class K3DecodeMLA(KimiK3MLAAttention):
         if not project_output:
             return core
         return self._project_output([core], position_ids, attn_metadata, None)
+
+    def _quantized_decode(
+        self,
+        ag: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """Keep FP8 projections around the native FP4/FP8 cache and attention kernels."""
+        query, latent_cache = _fp8_attention.mla_project_qkv(
+            ag,
+            self.q_a_layernorm.weight,
+            self._fp8_qb_weight,
+            self._fp8_qb_scale,
+            self.k_b_proj_trans,
+            self.k_b_proj_trans_scale,
+            self.kv_a_layernorm.weight,
+            float(self.q_a_layernorm.variance_epsilon),
+            float(self.kv_a_layernorm.variance_epsilon),
+        )
+        q_pe = query.view(-1, self.num_heads_tp, 576)[..., 512:]
+        cu_q = torch.empty(metadata.num_seqs + 1, dtype=torch.int32, device=ag.device)
+        cu_kv = torch.empty_like(cu_q)
+        scheduler = torch.empty(1, dtype=torch.uint32, device=ag.device)
+        bmm1 = torch.empty(2, dtype=torch.float32, device=ag.device)
+        bmm2 = torch.empty(1, dtype=torch.float32, device=ag.device)
+        quant_q = torch.empty_like(query, dtype=torch.uint8)
+        self.mqa.mla_rope_generation(
+            query.view(-1, self.num_heads_tp, 576),
+            q_pe,
+            latent_cache,
+            metadata,
+            cu_q,
+            cu_kv,
+            scheduler,
+            bmm1,
+            bmm2,
+            quant_q,
+            fuse_fp4_q_quant=bool(self.mqa.has_fp4_kv_cache),
+        )
+        latent = self._attn_forward_gen(
+            self.mqa,
+            query,
+            None,
+            None,
+            position_ids,
+            metadata,
+            attention_input_type=AttentionInputType.generation_only,
+            out_scale=self.out_scale,
+            latent_cache=latent_cache,
+            q_pe=q_pe,
+            cu_q_seqlens=cu_q,
+            cu_kv_seqlens=cu_kv,
+            fmha_scheduler_counter=scheduler,
+            mla_bmm1_scale=bmm1,
+            mla_bmm2_scale=bmm2,
+            quant_q_buffer=quant_q,
+        )
+        return _fp8_attention.mla_output(
+            latent,
+            self.v_b_proj,
+            self.v_b_proj_scale,
+            ag,
+            self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+        )
 
     def forward_generic(
         self,

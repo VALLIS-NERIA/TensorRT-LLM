@@ -229,13 +229,13 @@ def k3_kda_verify_kernel(
     cs_q: cutlass.Array,  # fp32 [pool][S][H * K]: raw conv inputs, column s = position s - 2 from the golden token
     cs_k: cutlass.Array,
     cs_v: cutlass.Array,
-    ssm: cutlass.Array,  # fp32 [pool][H][V][K] at slot stride ssm_stride: the state after the last golden token
+    ssm: cutlass.Array,  # fp32 or bf16 [pool][H][V][K] at slot stride ssm_stride: the last golden token's state
     state_tok: cutlass.Array,  # fp32 [pool][3][NUM_SPEC][H][K]: the records of the last round's drafts
     slots: cutlass.Array,  # int32 [N]
     pending: cutlass.Array,  # int32 [pool]: drafts the sampler accepted last round
     out: cutlass.Array,  # bf16 [T][H][V]
     proj_words: cutlass.Int32,
-    ssm_stride: cutlass.Int64,  # fp32 elements between the pool's slots (the manager interleaves conv states)
+    ssm_stride: cutlass.Int64,  # elements between the pool's slots (the manager interleaves conv states)
     H: cutlass.Constexpr[int],
     NUM_SPEC: cutlass.Constexpr[int],
     lower_bound: cutlass.Constexpr[float],
@@ -356,7 +356,8 @@ def k3_kda_verify_kernel(
     # The drafts' records, in each slot's region of state_tok: the row innovations vn [NUM_SPEC][H][V], then beta * k
     # and the decay [NUM_SPEC][H][K]. The state after the accepted drafts is the pool's (the golden token's) with each
     # accepted draft's update replayed, S = fma(decay, S, vn * (beta * k)): the recurrence's own arithmetic, so it is
-    # bit-identical to the one the drafts reached. k3_kda_attn uses the same records.
+    # bit-identical to the one the drafts reached with an FP32 pool. A BF16 pool rounds the committed golden state
+    # before replay. k3_kda_attn uses the same records.
     CT_VN = 0
     CT_WB = NUM_SPEC * H * V
     CT_WD = CT_WB + NUM_SPEC * H * K
@@ -367,7 +368,9 @@ def k3_kda_verify_kernel(
     st_base = (h * V + row_a) * K
     for r in cutlass.range_constexpr(ROWS):
         for i in cutlass.range_constexpr(VEC):
-            r_st.store(pool.load(idx=st_base + r * K + i * 32 + lane), idx=r * VEC + i)
+            r_st.store(
+                cutlass.Float32(pool.load(idx=st_base + r * K + i * 32 + lane)), idx=r * VEC + i
+            )
     for t_acc in cutlass.range(pend, unroll=1):
         rec_acc = (t_acc * H + h) * V
         vns_acc = [tok.load(idx=rec_acc + CT_VN + row_a + r) for r in range(ROWS)]
@@ -675,7 +678,7 @@ def k3_kda_verify_kernel(
         if cutlass.const_expr(tr == 0):
             for r in cutlass.range_constexpr(ROWS):
                 for i in cutlass.range_constexpr(VEC):
-                    pool.store(st[r * VEC + i], idx=st_base + r * K + i * 32 + lane)
+                    pool.store(ssm.dtype(st[r * VEC + i]), idx=st_base + r * K + i * 32 + lane)
         else:
             if lane < ROWS:
                 tok.store(

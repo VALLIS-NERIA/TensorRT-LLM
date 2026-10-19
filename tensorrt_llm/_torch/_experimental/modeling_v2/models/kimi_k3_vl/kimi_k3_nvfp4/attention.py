@@ -175,6 +175,7 @@ def _mla_qkv(
     T: tl.constexpr,
     QA_EPS: tl.constexpr,
     KV_EPS: tl.constexpr,
+    STORE_PAGED: tl.constexpr = True,
 ):
     head, chunk = tl.program_id(0), tl.program_id(1)
     rows = chunk * 16 + tl.arange(0, 16)
@@ -216,11 +217,16 @@ def _mla_qkv(
     qpe = tl.gather(q, tl.broadcast_to((128 + pe)[None, :], (16, 64)), 1)
     tl.store(OUT + base + 512 + pe[None, :], qpe, rows[:, None] < M)
     if head == 0:
-        seq = rows // T
-        length = tl.load(LENGTHS + seq, rows < M, 0)
-        pos = length - T + rows % T
-        page = tl.load(PAGES + seq * PAGE_STRIDE + pos // 64, (rows < M) & (pos >= 0), 0)
-        cache_row = ((page.to(tl.int64) + PAGE_OFFSET) * 64 + pos % 64) * ROW_STRIDE
+        if STORE_PAGED:
+            seq = rows // T
+            length = tl.load(LENGTHS + seq, rows < M, 0)
+            pos = length - T + rows % T
+            page = tl.load(PAGES + seq * PAGE_STRIDE + pos // 64, (rows < M) & (pos >= 0), 0)
+            cache_row = ((page.to(tl.int64) + PAGE_OFFSET) * 64 + pos % 64) * ROW_STRIDE
+            valid = (rows < M) & (pos >= 0)
+        else:
+            cache_row = rows * 576
+            valid = rows < M
         ckv = tl.load(
             AG + rows[:, None] * AG_STRIDE + 1536 + latent[None, :], rows[:, None] < M, 0
         ).to(tl.float32)
@@ -229,13 +235,13 @@ def _mla_qkv(
         tl.store(
             POOL + cache_row[:, None] + latent[None, :],
             ckv,
-            (rows[:, None] < M) & (pos[:, None] >= 0),
+            valid[:, None],
         )
         kpe = tl.load(AG + rows[:, None] * AG_STRIDE + 2048 + pe[None, :], rows[:, None] < M, 0)
         tl.store(
             POOL + cache_row[:, None] + 512 + pe[None, :],
             kpe,
-            (rows[:, None] < M) & (pos[:, None] >= 0),
+            valid[:, None],
         )
 
 
@@ -308,6 +314,105 @@ def _qkv_fake(
     kv_eps,
 ):
     return ag.new_empty((ag.shape[0], kb.shape[0] * 576))
+
+
+@torch.library.custom_op("trtllm::k3_fp8_mla_project_qkv", mutates_args=())
+def mla_project_qkv(
+    ag: torch.Tensor,
+    qa_norm: torch.Tensor,
+    qb: torch.Tensor,
+    qb_scale: torch.Tensor,
+    kb: torch.Tensor,
+    kb_scale: torch.Tensor,
+    kv_norm: torch.Tensor,
+    qa_eps: float,
+    kv_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Produce absorbed Q and normalized latent KV for quantized cache kernels."""
+    h = kb.shape[0]
+    query = ag.new_empty((ag.shape[0], h * 576))
+    latent = ag.new_empty((ag.shape[0], 576))
+    _mla_qkv[(h, triton.cdiv(ag.shape[0], 16))](
+        ag,
+        qa_norm,
+        qb,
+        qb_scale,
+        kb,
+        kb_scale,
+        kv_norm,
+        latent,
+        ag,
+        ag,
+        query,
+        ag.shape[0],
+        h,
+        ag.stride(0),
+        qb_scale.stride(0),
+        *kb.stride(),
+        *kb_scale.stride(),
+        576,
+        0,
+        0,
+        1,
+        qa_eps,
+        kv_eps,
+        STORE_PAGED=False,
+        num_warps=8,
+    )
+    return query, latent
+
+
+@mla_project_qkv.register_fake
+def _project_qkv_fake(ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, qa_eps, kv_eps):
+    return ag.new_empty((ag.shape[0], kb.shape[0] * 576)), ag.new_empty((ag.shape[0], 576))
+
+
+@triton.jit
+def _mla_output(
+    LATENT,
+    VB,
+    VS,
+    GATE,
+    OUT,
+    H: tl.constexpr,
+    GATE_STRIDE: tl.constexpr,
+    GATE_COL: tl.constexpr,
+):
+    row, head = tl.program_id(0), tl.program_id(1)
+    k = tl.arange(0, 128)
+    projected_tile = tl.full((16, 128), 0, tl.float32)
+    for group in tl.static_range(4):
+        latent = tl.load(LATENT + (row * H + head) * 512 + group * 128 + k).to(tl.float32)
+        scale = tl.maximum(tl.max(tl.abs(latent), 0) / 448.0, 1.0e-12)
+        activation = tl.broadcast_to((latent / scale)[None, :], (16, 128)).to(tl.float8e4nv)
+        weights = tl.load(VB + head * 128 * 512 + k[None, :] * 512 + group * 128 + k[:, None])
+        projected_tile += tl.dot(activation, weights) * scale * tl.load(VS + head * 4 + group)
+    projected = tl.sum(tl.where(tl.arange(0, 16)[:, None] == 0, projected_tile, 0), 0)
+    projected = projected.to(tl.bfloat16).to(tl.float32)
+    gate = tl.sigmoid(tl.load(GATE + row * GATE_STRIDE + GATE_COL + head * 128 + k).to(tl.float32))
+    tl.store(OUT + (row * H + head) * 128 + k, projected * gate)
+
+
+@torch.library.custom_op("trtllm::k3_fp8_mla_output", mutates_args=())
+def mla_output(
+    latent: torch.Tensor,
+    vb: torch.Tensor,
+    vb_scale: torch.Tensor,
+    gate: torch.Tensor,
+    gate_col: int,
+) -> torch.Tensor:
+    """Fuse FP8 V-B absorption and output gating after FP4/FP8 attention."""
+    h = vb.shape[0]
+    output = latent.new_empty((latent.shape[0], h * 128))
+    _mla_output[(latent.shape[0], h)](
+        latent, vb, vb_scale, gate, output, h, gate.stride(0), gate_col, num_warps=4
+    )
+    return output
+
+
+@mla_output.register_fake
+def _output_fake(latent, vb, vb_scale, gate, gate_col):
+    return latent.new_empty((latent.shape[0], vb.shape[0] * 128))
 
 
 @triton.jit
