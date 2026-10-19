@@ -2368,6 +2368,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
                 or not 0 < step.tokens_per_request <= 8
                 or step.num_tokens != metadata.num_generations * step.tokens_per_request
                 or metadata.beam_width != 1
+                or getattr(metadata, "is_ragged_verify", False)
                 or getattr(metadata, "is_spec_dec_tree", False)
                 or getattr(metadata, "is_spec_dec_dynamic_tree", False)
             ):
@@ -2455,7 +2456,9 @@ class K3DecodeMLA(KimiK3MLAAttention):
         scheduler = torch.empty(1, dtype=torch.uint32, device=ag.device)
         bmm1 = torch.empty(2, dtype=torch.float32, device=ag.device)
         bmm2 = torch.empty(1, dtype=torch.float32, device=ag.device)
-        quant_q = torch.empty_like(query, dtype=torch.uint8)
+        quant_q = torch.empty(
+            (ag.shape[0], self.num_heads_tp, 576), dtype=torch.uint8, device=ag.device
+        )
         self.mqa.mla_rope_generation(
             query.view(-1, self.num_heads_tp, 576),
             q_pe,

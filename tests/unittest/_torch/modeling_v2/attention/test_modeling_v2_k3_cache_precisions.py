@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """K3 fused FP8 projections around BF16, FP8 and NVFP4 paged MLA caches."""
 
+import copy
 import weakref
 
 import pytest
@@ -15,7 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvf
     K3DecodeMLA,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
-from tensorrt_llm._torch.attention.backends.interface import KVCacheParams
+from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures, KVCacheParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -24,7 +25,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm._torch.utils import model_extra_attrs
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -36,9 +37,9 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("cache_dtype", ["bf16", "fp8", "nvfp4"])
-@pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("batch,tokens", [(1, 1), (2, 1), (4, 1), (1, 4), (2, 4), (4, 4)])
 @torch.inference_mode()
-def test_fp8_mla_cache_precisions(monkeypatch, cache_dtype: str, batch: int) -> None:
+def test_fp8_mla_cache_precisions(monkeypatch, cache_dtype: str, batch: int, tokens: int) -> None:
     import tensorrt_llm._torch.modules.kimi_k3_mla as mla_package
 
     torch.manual_seed(451)
@@ -121,9 +122,10 @@ def test_fp8_mla_cache_precisions(monkeypatch, cache_dtype: str, batch: int) -> 
         dtype={"bf16": DataType.BF16, "fp8": DataType.FP8, "nvfp4": DataType.NVFP4}[cache_dtype],
         max_num_tokens=batch * context_length,
         pretrained_config=config,
+        spec_config=MTPDecodingConfig(max_draft_len=tokens - 1) if tokens > 1 else None,
     )
     try:
-        requests = manager.add_dummy_requests(list(range(batch)), [context_length + 1] * batch)
+        requests = manager.add_dummy_requests(list(range(batch)), [context_length + tokens] * batch)
         assert requests is not None
         for request in requests:
             request.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -132,7 +134,9 @@ def test_fp8_mla_cache_precisions(monkeypatch, cache_dtype: str, batch: int) -> 
 
         def metadata(context: bool):
             meta = get_attention_backend("TRTLLM").Metadata(
-                seq_lens=torch.full((batch,), context_length if context else 1, dtype=torch.int),
+                seq_lens=torch.full(
+                    (batch,), context_length if context else tokens, dtype=torch.int
+                ),
                 request_ids=list(range(batch)),
                 max_num_requests=batch,
                 num_contexts=batch if context else 0,
@@ -145,12 +149,15 @@ def test_fp8_mla_cache_precisions(monkeypatch, cache_dtype: str, batch: int) -> 
                 ),
                 mapping=mapping,
                 enable_context_mla_with_cached_kv=True,
+                max_total_draft_tokens=tokens - 1,
+                runtime_features=AttentionRuntimeFeatures(has_speculative_draft_tokens=tokens > 1),
             )
             meta.prepare()
             return meta
 
         hidden = (
-            torch.randn(batch, context_length + 1, 256, device="cuda", dtype=torch.bfloat16) * 0.2
+            torch.randn(batch, context_length + tokens, 256, device="cuda", dtype=torch.bfloat16)
+            * 0.2
         )
         ctx = metadata(True)
         attrs = {
@@ -163,8 +170,8 @@ def test_fp8_mla_cache_precisions(monkeypatch, cache_dtype: str, batch: int) -> 
             )
         gen = metadata(False)
         attrs["attention_metadata"] = weakref.ref(gen)
-        x = hidden[:, -1].contiguous()
-        step = DecodeStep(batch, batch, 1)
+        x = hidden[:, context_length:].flatten(0, 1).contiguous()
+        step = DecodeStep(batch * tokens, batch, tokens)
         assert runtime.will_run_decode_branch(gen, step)
         with model_extra_attrs(attrs):
             expected = runtime.forward_generic(None, x, gen)
@@ -219,8 +226,12 @@ def test_fp4_core_matches_dequantized_reference(monkeypatch, batch: int, tokens:
             prequantized_q_sf=state.prequantized_q_sf,
             q_batch_capacity=state.q_batch_capacity,
         )
+        reference_meta = copy.copy(meta)
+        reference_meta.fp4_mla_state = copy.copy(state)
+        reference_meta.fp4_mla_state.workspaces = dict(state.workspaces)
+        reference_meta.fp4_mla_state.workspaces.pop("_fp4_mla_attention_p_buf", None)
         expected, _ = _fp4_mla_attention_decode_reference(
-            meta,
+            reference_meta,
             query[..., :kv_rank],
             query[..., kv_rank:],
             sm_scale=0.1,
