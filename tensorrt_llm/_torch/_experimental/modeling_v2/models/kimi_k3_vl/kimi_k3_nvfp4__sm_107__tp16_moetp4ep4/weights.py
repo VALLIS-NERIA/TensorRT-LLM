@@ -2,5 +2,5 @@
 # SPDX-License-Identifier: Apache-2.0
 """The shared Kimi K3 text checkpoint loader."""
 
-from ..weights import PREDICTED_NON_LOAD as PREDICTED_NON_LOAD
-from ..weights import load as load
+from ..kimi_k3_nvfp4.weights import PREDICTED_NON_LOAD as PREDICTED_NON_LOAD
+from ..kimi_k3_nvfp4.weights import load as load

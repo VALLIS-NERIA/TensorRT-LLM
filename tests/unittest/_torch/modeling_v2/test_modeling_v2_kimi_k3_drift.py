@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""K3 targets share the model lifecycle while preserving each checkpoint's layout."""
+"""NVFP4 targets share one implementation and leave the original MXFP4 targets independent."""
 
 import importlib
 from types import SimpleNamespace
@@ -8,19 +8,47 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import modeling
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+    implementation as modeling,
+)
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.mark.parametrize("moe_tp,moe_ep", [(4, 4), (16, 1)])
+def test_sm100_mxfp4_keeps_its_own_model(moe_tp: int, moe_ep: int) -> None:
+    module = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        f"kimi_k3_mxfp4__sm_100__tp16_moetp{moe_tp}ep{moe_ep}.modeling"
+    )
+    target = getattr(module, f"ModelingV2KimiK3Mxfp4Sm100Tp16Moetp{moe_tp}ep{moe_ep}")
+    assert target.forward.__module__ == module.__name__
+    assert target.forward is not modeling.ModelingV2KimiK3.forward
+
+
+def test_fp8_mla_preserves_raw_query_weights_before_backend_transformation() -> None:
+    attention = modeling.K3DecodeMLA.__new__(modeling.K3DecodeMLA)
+    torch.nn.Module.__init__(attention)
+    codes = torch.ones(128, 128).to(torch.float8_e4m3fn)
+    scales = torch.full((1, 1), 0.125)
+    attention.q_b_proj = SimpleNamespace(
+        weight=codes,
+        weight_scale=scales,
+        out_features=128,
+        in_features=128,
+    )
+    attention.prepare_fp8_decode_weights()
+    codes.zero_()
+    scales.zero_()
+    assert attention._fp8_qb_weight.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(attention._fp8_qb_weight.float(), torch.ones(128, 128))
+    torch.testing.assert_close(attention._fp8_qb_scale, torch.full((1, 1), 0.125))
+
+
 @pytest.mark.parametrize(
     "sm,fmt,moe_tp,moe_ep",
     [
-        (100, "mxfp4", 4, 4),
-        (100, "mxfp4", 16, 1),
-        (103, "mxfp4", 4, 4),
-        (103, "mxfp4", 16, 1),
         (103, "nvfp4", 4, 4),
         (107, "nvfp4", 4, 4),
     ],

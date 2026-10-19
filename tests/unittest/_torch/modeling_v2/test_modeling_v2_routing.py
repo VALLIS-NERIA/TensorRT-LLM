@@ -548,7 +548,7 @@ def test_kimi_k3_nvfp4_declines_excluded_experts(monkeypatch: pytest.MonkeyPatch
 def test_kimi_k3_nvfp4_constructor_uses_per_layer_quantization():
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.modeling import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4.implementation import (
         KimiK3MoERuntime,
     )
 
@@ -567,7 +567,7 @@ def test_kimi_k3_nvfp4_constructor_uses_per_layer_quantization():
 
 @pytest.mark.parametrize("prefix", ["language_model.model.", "model.", ""])
 def test_kimi_k3_nvfp4_experts_honor_excluded_aliases(prefix: str) -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.modeling import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4.implementation import (
         KimiK3MoERuntime,
     )
     from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -613,7 +613,9 @@ def test_kimi_k3_nvfp4_keeps_mla_dspark_worker():
 
 @pytest.mark.parametrize("prefix", ["language_model.model.", "model.", ""])
 def test_kimi_k3_nvfp4_attention_quantization_preserves_config(prefix: str) -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import modeling as target
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        implementation as target,
+    )
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     projection = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
@@ -633,7 +635,9 @@ def test_kimi_k3_nvfp4_attention_quantization_preserves_config(prefix: str) -> N
 
 
 def test_kimi_k3_nvfp4_attention_honors_exclusions() -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import modeling as target
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        implementation as target,
+    )
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     config = ModelConfig(
@@ -657,7 +661,9 @@ def test_kimi_k3_nvfp4_attention_honors_exclusions() -> None:
 def test_kimi_k3_nvfp4_attention_rejects_unsupported_quantization(
     algo: QuantAlgo, group_size: int
 ) -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import modeling as target
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        implementation as target,
+    )
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     config = ModelConfig(
@@ -671,7 +677,9 @@ def test_kimi_k3_nvfp4_attention_rejects_unsupported_quantization(
 
 
 def test_kimi_k3_nvfp4_attention_rejects_conflicting_block_sizes() -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import modeling as target
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        implementation as target,
+    )
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     config = ModelConfig(

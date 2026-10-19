@@ -5,8 +5,8 @@
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..modeling import K3TargetSpec, ModelingV2KimiK3
-from ..modeling import _check_construction as _check_target_construction
+from ..kimi_k3_nvfp4.implementation import K3TargetSpec, ModelingV2KimiK3
+from ..kimi_k3_nvfp4.implementation import _check_construction as _check_target_construction
 
 _TARGET = K3TargetSpec(sm=(10, 3), quant_algo=QuantAlgo.NVFP4, moe_tp=4, moe_ep=4)
 

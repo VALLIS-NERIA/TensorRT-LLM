@@ -130,7 +130,15 @@ def test_every_target_ships_both_products():
 
 def test_targets_only_import_their_declared_family_implementation():
     """K3 targets may share their family implementation, never another family's."""
-    k3_shared_modules = {"modeling", "weights", "decode_comm", "decode_gemv", "spec_worker"}
+    k3_shared_modules = {
+        "modeling",
+        "weights",
+        "decode_comm",
+        "decode_gemv",
+        "spec_worker",
+        "kimi_k3_nvfp4.implementation",
+        "kimi_k3_nvfp4.weights",
+    }
     for arch in _ARCHS:
         for target_dir, name in _routed_targets(arch):
             for source_file in target_dir.glob("*.py"):
@@ -193,7 +201,10 @@ def test_uncertified_generic_calls_name_every_stock_import():
         for target_dir, name in _routed_targets(arch):
             source_file = target_dir / "modeling.py"
             if target_dir.parent.name == "kimi_k3_vl":
-                source_file = target_dir.parent / "modeling.py"
+                if "nvfp4" in target_dir.name:
+                    source_file = target_dir.parent / "kimi_k3_nvfp4" / "implementation.py"
+                elif "sm_103" in target_dir.name:
+                    source_file = target_dir.parent / "modeling.py"
             tree = ast.parse(source_file.read_text())
             declared = _declared_tuple(tree, "UNCERTIFIED_GENERIC_CALLS")
             if declared is None:

@@ -10,17 +10,17 @@ entries, sharing nothing with its siblings, and trusted through accuracy gates
 instead of shared abstractions. The one-to-one correspondence between
 `models/<x>/` here and `modeling_<x>.py` there is the point of the exercise.
 
-Kimi K3 keeps concrete checkpoint, SM and parallelism identities in thin target
-classes and shares its implementation within `models/kimi_k3_vl/`. Its MXFP4 and
-NVFP4 targets use the same decoder, attention residuals, BF16 GEMVs, speculative
-worker and checkpoint streaming lifecycle. The expert checkpoint specification
-selects the loader and finalization behavior. MXFP4 uses the K3 MXFP4/MXFP8 fused
-decode kernels; NVFP4 uses the existing NVFP4 MoE kernels and stock quantized
-attention, preserving FP8 projection metadata and the configured KV-cache format.
-The MXFP4 fusion's group-32 E8M0 scales and MXFP8 intermediate differ from NVFP4's
-group-16 scales and FP4 activation quantization, so the formats keep independent
-MoE kernels. Shared model code does not imply shared accuracy or performance
-certification: every hardware and quantization target needs its own gates.
+Kimi K3 keeps its original MXFP4/SM100 deployments independent. The NVFP4
+implementation is a separate copy under `models/kimi_k3_vl/kimi_k3_nvfp4/`,
+shared by thin SM103 and SM107 target classes. NVFP4 retains checkpoint FP8
+projection weights and activations: decode fuses KDA's gate, convolution,
+recurrence and output normalization, and MLA's query/absorption/cache writes
+and attention/V-B/output gate. The ordinary FP8 GEMMs remain responsible for
+input and output projections. MLA's fused decode currently reads a BF16 KV
+cache with 64-token pages; other layouts use the native path. The KDA fused
+verify path retains FP32 states and the original per-token draft records.
+The NVFP4 expert kernels remain separate from the MXFP4/MXFP8 kernels.
+Every hardware and quantization target requires its own accuracy gates.
 
 ## Using it
 
