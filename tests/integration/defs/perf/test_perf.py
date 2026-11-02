@@ -65,8 +65,9 @@ NEMOTRON_SUPER_MODELS = {
 
 # Models that run out of memory on H100 at the default KV cache fraction, mapped
 # to the largest fraction they run with there. The profiled KV budget leaves
-# too little free memory for the eager full-batch logits.float() allocation.
-_H100_KV_CACHE_FRACTION_CAPS = {"qwen3.5_122b_a10b": 0.8}
+# too little free memory for the eager full-batch logits.float() allocation and
+# for KV cache growth.
+_H100_KV_CACHE_FRACTION_CAPS = {"qwen3.5_122b_a10b": 0.7}
 
 KIMI_K3_MODELS = {"kimi_k3"}
 DEEPSEEK_V41_MODELS = {
